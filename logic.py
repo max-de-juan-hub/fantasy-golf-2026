@@ -5,7 +5,12 @@ from datetime import datetime
 # --- SEASONS ---
 def get_season(date_obj):
     if isinstance(date_obj, str):
-        date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
+        try:
+            date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
+        except ValueError:
+            # Handle different date formats if Google sends them weirdly
+            date_obj = datetime.now().date()
+            
     m = date_obj.month
     d = date_obj.day
     if 1 <= m <= 3: return "Season 1"
@@ -19,25 +24,27 @@ def get_season(date_obj):
 def calculate_rp(stableford_score, clean_sheet=False, hole_in_one=False, bonuses=0):
     """
     Calculates RP based on Stableford performance + Bonuses.
-    Uses x2 Multiplier for positive performance.
     """
+    # SAFETY: Ensure inputs are numbers
+    score = int(float(stableford_score))
+    
     target = 36
     note_parts = []
     
     # 1. Base Score Logic
-    if stableford_score >= target:
+    if score >= target:
         # x2 Multiplier Rule
-        diff = stableford_score - target
+        diff = score - target
         base = diff * 2
         note_parts.append(f"Stbl Perf (+{base})")
     else:
         # Damage Control
-        diff = stableford_score - target
+        diff = score - target
         base = round(diff / 2) 
         note_parts.append(f"Stbl Perf ({base})")
         
     # 2. Add Bonuses
-    total = base + bonuses
+    total = base + float(bonuses)
     
     if clean_sheet:
         total += 2
@@ -52,6 +59,10 @@ def calculate_rp(stableford_score, clean_sheet=False, hole_in_one=False, bonuses
 # --- BONUS CALCULATOR (GROUP) ---
 def calculate_group_bonuses(group_data, current_standings):
     results = {}
+    
+    # SAFETY: Ensure stableford scores are numbers for sorting
+    for p in group_data:
+        p['stbl'] = int(float(p['stbl']))
     
     # 1. Identify Winners and Pot Size
     sorted_players = sorted(group_data, key=lambda x: x['stbl'], reverse=True)
@@ -89,10 +100,11 @@ def calculate_group_bonuses(group_data, current_standings):
             
         # C. Giant Slayer
         slayer_pts = 0
-        my_rp = current_standings.get(name, {}).get('rp', 0)
+        my_rp = float(current_standings.get(name, {}).get('rp', 0))
+        
         for opp in group_data:
             if opp['name'] == name: continue
-            opp_rp = current_standings.get(opp['name'], {}).get('rp', 0)
+            opp_rp = float(current_standings.get(opp['name'], {}).get('rp', 0))
             if score > opp['stbl'] and opp_rp > my_rp:
                 slayer_pts += 1
         
@@ -100,13 +112,13 @@ def calculate_group_bonuses(group_data, current_standings):
             bonuses += slayer_pts
             notes.append(f"Giant Slayer (+{slayer_pts})")
             
-        # D. Road Warrior / Clean / HIO
-        if p['road_warrior']:
+        # D. Road Warrior
+        if p.get('road_warrior', False):
             bonuses += 2
             notes.append("Road Warrior (+2)")
         
         # Calculate Base RP
-        base_rp, base_note = calculate_rp(score, p['clean'], p['hio'], bonuses)
+        base_rp, base_note = calculate_rp(score, p.get('clean', False), p.get('hio', False), bonuses)
         final_notes = f"{base_note}, {', '.join(notes)}"
 
         results[name] = {
@@ -119,6 +131,10 @@ def calculate_group_bonuses(group_data, current_standings):
 
 # --- HANDICAP ---
 def calculate_new_handicap(current_hcp, stableford_score, is_away_game=False, par_70_plus=False):
+    # SAFETY CASTS
+    current_hcp = float(current_hcp)
+    stableford_score = int(float(stableford_score))
+
     playing_hcp = current_hcp
     if is_away_game and par_70_plus:
         if current_hcp <= 10: playing_hcp += 3
@@ -138,6 +154,12 @@ def calculate_new_handicap(current_hcp, stableford_score, is_away_game=False, pa
 
 # --- RIVALRY 1v1 LOGIC ---
 def calculate_rivalry_1v1(p1_strokes, p2_strokes, p1_hcp, p2_hcp):
+    # SAFETY CASTS
+    p1_strokes = int(float(p1_strokes))
+    p2_strokes = int(float(p2_strokes))
+    p1_hcp = float(p1_hcp)
+    p2_hcp = float(p2_hcp)
+
     winner = None
     reason = ""
     
@@ -173,12 +195,6 @@ def calculate_rivalry_1v1(p1_strokes, p2_strokes, p1_hcp, p2_hcp):
 
 # --- TIE BREAKER / HALL OF FAME LOGIC ---
 def resolve_tie_via_head_to_head(tied_players_list, history_df):
-    """
-    Returns:
-    - Single Name (str) if winner found.
-    - List of Names (list) if tie remains.
-    - None if no eligible players.
-    """
     if len(tied_players_list) == 1:
         return tied_players_list[0], "Clear Winner"
     
@@ -188,10 +204,10 @@ def resolve_tie_via_head_to_head(tied_players_list, history_df):
     h2h_wins = {name: 0 for name in tied_players_list}
     matches_found = False
     
-    if history_df.empty: return tied_players_list, "No History" # Return all tied
+    if history_df.empty: return tied_players_list, "No History"
 
     if 'match_group_id' in history_df.columns:
-        history_df['group_key'] = history_df['match_group_id'].fillna(history_df['date'] + history_df['course'])
+        history_df['group_key'] = history_df['match_group_id'].fillna(history_df['date'].astype(str) + history_df['course'])
         grouped = history_df.groupby('group_key')
     else:
         grouped = history_df.groupby(['date', 'course'])
@@ -218,5 +234,4 @@ def resolve_tie_via_head_to_head(tied_players_list, history_df):
     if len(best_h2h_players) == 1:
         return best_h2h_players[0], f"Won H2H ({max_wins} wins)"
     else:
-        # Return the LIST of tied players so we can show "Tie: Alice, Bob"
         return best_h2h_players, "Tie Unresolved (Equal H2H record)"

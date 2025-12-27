@@ -1,113 +1,89 @@
-import sqlite3
+import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 import pandas as pd
+from datetime import datetime
 
-DB_NAME = "league_data.db"
+# --- CONNECTION SETUP ---
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    
-    # Create Tables
-    c.execute('''CREATE TABLE IF NOT EXISTS players (
-                    name TEXT PRIMARY KEY,
-                    handicap REAL,
-                    starting_handicap REAL,
-                    total_rp REAL,
-                    rounds_played INTEGER,
-                    wins INTEGER DEFAULT 0
-                )''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS rounds (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    match_group_id TEXT, 
-                    player_name TEXT,
-                    date TEXT,
-                    season TEXT,
-                    course TEXT,
-                    gross_score INTEGER,
-                    stableford_score INTEGER,
-                    rp_earned REAL,
-                    new_handicap REAL,
-                    notes TEXT,
-                    clean_sheet INTEGER DEFAULT 0,
-                    hole_in_one INTEGER DEFAULT 0,
-                    is_rivalry INTEGER DEFAULT 0
-                )''')
-    
-    # MIGRATION: Check if match_group_id exists (for existing DBs)
-    c.execute("PRAGMA table_info(rounds)")
-    columns = [info[1] for info in c.fetchall()]
-    if "match_group_id" not in columns:
-        print("Migrating DB: Adding match_group_id column...")
-        c.execute("ALTER TABLE rounds ADD COLUMN match_group_id TEXT")
-        
-    conn.commit()
-    conn.close()
-
-def add_player(name, handicap):
-    conn = sqlite3.connect(DB_NAME)
+def get_client():
+    """Connects to Google Sheets using secrets."""
     try:
-        conn.execute("INSERT INTO players VALUES (?, ?, ?, 0, 0, 0)", (name, handicap, handicap))
-        conn.commit()
-        return True
-    except: return False
-    finally: conn.close()
+        # Load the dictionary from secrets
+        creds_dict = st.secrets["gcp_service_account"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        st.error(f"Error connecting to Google Sheets: {e}")
+        return None
 
-def delete_player(name):
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("DELETE FROM players WHERE name = ?", (name,))
-    conn.execute("DELETE FROM rounds WHERE player_name = ?", (name,))
-    conn.commit()
-    conn.close()
+def get_db():
+    """Returns the Spreadsheet object."""
+    client = get_client()
+    if client:
+        # Make sure this matches your Sheet Name EXACTLY
+        return client.open("fantasy_golf_db") 
+    return None
 
-def save_round(player, date, season, course, gross, stbl, rp, new_hcp, notes, clean=0, hio=0, rivalry=0, match_group_id=None):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("""INSERT INTO rounds 
-                 (match_group_id, player_name, date, season, course, gross_score, stableford_score, rp_earned, new_handicap, notes, clean_sheet, hole_in_one, is_rivalry) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
-              (match_group_id, player, date, season, course, gross, stbl, rp, new_hcp, notes, clean, hio, rivalry))
-    
-    c.execute("""UPDATE players 
-                 SET handicap = ?, total_rp = total_rp + ?, rounds_played = rounds_played + 1 
-                 WHERE name = ?""", (new_hcp, rp, player))
-    conn.commit()
-    conn.close()
-
-def delete_round_group(match_group_id):
-    """Deletes all rounds associated with a specific match submission."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    
-    # 1. Revert Player Stats
-    c.execute("SELECT player_name, rp_earned FROM rounds WHERE match_group_id = ?", (match_group_id,))
-    for p_name, rp in c.fetchall():
-        c.execute("UPDATE players SET total_rp = total_rp - ?, rounds_played = rounds_played - 1 WHERE name = ?", (rp, p_name))
-        
-    # 2. Delete Rounds
-    c.execute("DELETE FROM rounds WHERE match_group_id = ?", (match_group_id,))
-    conn.commit()
-    conn.close()
-
-def get_leaderboard():
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query("SELECT * FROM players ORDER BY total_rp DESC", conn)
-    conn.close()
+# --- READ DATA ---
+def load_players():
+    sh = get_db()
+    worksheet = sh.worksheet("players")
+    data = worksheet.get_all_records()
+    df = pd.DataFrame(data)
+    # Ensure columns exist even if sheet is empty
+    if df.empty:
+        return pd.DataFrame(columns=["name", "handicap", "total_rp", "rounds_played", "wins"])
     return df
 
-def get_history():
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query("SELECT * FROM rounds ORDER BY date DESC, id DESC", conn)
-    conn.close()
+def load_history():
+    sh = get_db()
+    worksheet = sh.worksheet("rounds")
+    data = worksheet.get_all_records()
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame(columns=["date", "course", "player_name", "stableford_score", "rp_earned", "notes"])
     return df
 
-def has_played_2v2(player_name):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT count(*) FROM rounds WHERE player_name = ? AND is_rivalry = 1", (player_name,))
-    count = c.fetchone()[0]
-    conn.close()
-    return count > 0
+# --- WRITE DATA ---
+def update_player_stats(player_name, new_hcp, rp_gained, is_win=False):
+    sh = get_db()
+    ws = sh.worksheet("players")
+    
+    # Get all data to find the row index
+    data = ws.get_all_records()
+    
+    # Find the row number for the player (Google Sheets is 1-indexed, +1 for header)
+    row_idx = None
+    for i, row in enumerate(data):
+        if row['name'] == player_name:
+            row_idx = i + 2  # +2 because enumerate starts at 0, and sheets starts at 1, plus header
+            current_rp = float(row['total_rp'])
+            current_rounds = int(row['rounds_played'])
+            current_wins = int(row['wins'])
+            break
+    
+    if row_idx:
+        # UPDATE EXISTING PLAYER
+        ws.update_cell(row_idx, 2, new_hcp)  # Col 2: Handicap
+        ws.update_cell(row_idx, 3, current_rp + rp_gained) # Col 3: RP
+        ws.update_cell(row_idx, 4, current_rounds + 1) # Col 4: Rounds
+        if is_win:
+            ws.update_cell(row_idx, 5, current_wins + 1) # Col 5: Wins
+    else:
+        # CREATE NEW PLAYER (If they don't exist yet)
+        wins = 1 if is_win else 0
+        new_row = [player_name, new_hcp, rp_gained, 1, wins]
+        ws.append_row(new_row)
 
-if __name__ == "__main__":
-    init_db()
+def log_round(date, course, player_name, stbl, rp, notes, match_id):
+    sh = get_db()
+    ws = sh.worksheet("rounds")
+    # Append the round data
+    row = [str(date), course, player_name, stbl, rp, notes, match_id]
+    ws.append_row(row)
