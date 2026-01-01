@@ -298,11 +298,10 @@ with tab_submit:
                         })
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
-                    st.success(f"Saved {len(players)} rounds!")
+                    st.success(f"Saved {len(selected_players)} rounds!")
                     st.rerun()
 
     elif mode == "The Duel (1v1)":
-        # MOVED PLAYER SELECTORS OUTSIDE FORM TO FIX REFRESH BUG
         st.warning("⚔️ **1v1 STAKES**")
         c1, c2 = st.columns(2)
         p1 = c1.selectbox("P1", player_list)
@@ -340,7 +339,6 @@ with tab_submit:
                     st.rerun()
 
     elif mode == "The Alliance (2v2)":
-        # MOVED SELECTORS OUTSIDE FORM
         c1, c2 = st.columns(2)
         w1 = c1.selectbox("Win 1", player_list, key="w1")
         w2 = c1.selectbox("Win 2", player_list, key="w2")
