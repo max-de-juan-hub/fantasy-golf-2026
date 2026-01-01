@@ -15,26 +15,36 @@ SPREADSHEET_NAME = "fantasy_golf_db"
 
 # --- HELPER FUNCTIONS ---
 def load_data(conn):
-    try:
-        players = conn.read(worksheet="players", spreadsheet=SPREADSHEET_NAME, ttl=0)
-        rounds = conn.read(worksheet="rounds", spreadsheet=SPREADSHEET_NAME, ttl=0)
-        
-        defaults = {
-            "holes_played": "18", "gross_score": 0, "match_type": "Standard", 
-            "notes": "", "stableford_score": 0, "rp_earned": 0
-        }
-        for col, val in defaults.items():
-            if col not in rounds.columns: rounds[col] = val
-        
-        rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str)
-        rounds["gross_score"] = rounds["gross_score"].fillna(0).astype(int)
-        rounds["stableford_score"] = rounds["stableford_score"].fillna(0).astype(int)
-        rounds["rp_earned"] = rounds["rp_earned"].fillna(0).astype(int)
-        rounds["date"] = pd.to_datetime(rounds["date"], errors='coerce')
-        
-        return players, rounds
-    except Exception:
-        return pd.DataFrame(columns=["name", "handicap"]), pd.DataFrame()
+    # REMOVED the silent try/except block to expose real errors if they happen
+    # and added robust data cleaning to prevent crashes on empty cells.
+    
+    players = conn.read(worksheet="players", spreadsheet=SPREADSHEET_NAME, ttl=0)
+    rounds = conn.read(worksheet="rounds", spreadsheet=SPREADSHEET_NAME, ttl=0)
+    
+    # 1. Ensure Columns Exist
+    defaults = {
+        "holes_played": "18", "gross_score": 0, "match_type": "Standard", 
+        "notes": "", "stableford_score": 0, "rp_earned": 0, "course": "Unknown"
+    }
+    for col, val in defaults.items():
+        if col not in rounds.columns: 
+            rounds[col] = val
+
+    # 2. Safe Type Conversion (Prevents crashes if cells have spaces/text)
+    rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str)
+    
+    # Force numeric columns to be numbers, turn errors (like "") into NaN, then fill with 0
+    cols_to_numeric = ["gross_score", "stableford_score", "rp_earned"]
+    for col in cols_to_numeric:
+        rounds[col] = pd.to_numeric(rounds[col], errors='coerce').fillna(0).astype(int)
+
+    # Date conversion
+    rounds["date"] = pd.to_datetime(rounds["date"], errors='coerce')
+    
+    # Filter out rows with invalid dates (garbage cleanup)
+    rounds = rounds.dropna(subset=["date"])
+    
+    return players, rounds
 
 def calculate_new_handicap(current_hcp, score):
     """
@@ -48,19 +58,22 @@ def calculate_new_handicap(current_hcp, score):
         - Score > 36: Cut 1.0 per point over 36.
         - Else: Normal rules (usually +1 or 0)
     """
-    if current_hcp > 36:
+    # Ensure inputs are float/int
+    current_hcp = float(current_hcp)
+    score = int(score)
+    
+    if current_hcp > 36.0:
         if score > 36:
-            drop = score - 36
-            return max(0, current_hcp - drop)
+            drop = float(score - 36)
+            return max(0.0, current_hcp - drop)
         else:
-            # If sandbagger plays bad, standard rules apply (likely +1 if <27)
             if score < 27: return current_hcp + 1.0
             return current_hcp
     else:
-        if score >= 40: return max(0, current_hcp - 2.0)
-        elif score >= 37: return max(0, current_hcp - 1.0)
+        if score >= 40: return max(0.0, current_hcp - 2.0)
+        elif score >= 37: return max(0.0, current_hcp - 1.0)
         elif score < 27: return current_hcp + 1.0
-        else: return current_hcp # Zone 27-36
+        else: return current_hcp
 
 def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, current_player, player_rp_map):
     breakdown = []
@@ -111,7 +124,9 @@ def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, c
         slayer = 0
         for opp in group_data:
             if opp['name'] != current_player and score > opp['score']:
-                if player_rp_map.get(opp['name'], 0) > my_total:
+                # Check opponent rank
+                opp_total = player_rp_map.get(opp['name'], 0)
+                if opp_total > my_total:
                     slayer += 1
         
         if slayer > 0:
@@ -197,30 +212,18 @@ if not df_rounds.empty:
 holder_rock, holder_sniper, holder_conq = None, None, None
 
 def resolve_tie(candidates, metric):
-    # candidates: DataFrame slice. metric: col name to compare
-    # Tie-Breaker: Daily Wins
     if len(candidates) == 1: return candidates.index[0]
-    
-    # Filter by max metric
     best_val = candidates[metric].max() if metric != "Best Gross" else candidates[metric].min()
     tied = candidates[candidates[metric] == best_val]
-    
     if len(tied) == 1: return tied.index[0]
-    
-    # Secondary: Daily Wins
     best_wins = tied["Daily Wins"].max()
     tied_wins = tied[tied["Daily Wins"] == best_wins]
-    
     if len(tied_wins) == 1: return tied_wins.index[0]
-    
-    # Still tied
     return "Tied"
 
 # Rock (Avg Score, Min 3 Rounds)
 q_rock = stats[stats["Rounds"] >= 3]
 if not q_rock.empty:
-    # Need lowest Avg? No, highest stableford avg usually. Or Lowest Strokes?
-    # User said "The Rock: Highest Average Score". Okay.
     holder_rock = resolve_tie(q_rock, "Avg Score")
     if holder_rock != "Tied" and holder_rock:
         stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
@@ -236,16 +239,12 @@ m_rnds = df_rounds[
 ]
 if not m_rnds.empty:
     min_g = m_rnds["gross_score"].min()
-    # Find players with min_g
     snipers_list = m_rnds[m_rnds["gross_score"] == min_g]["player_name"].unique()
-    
-    # Resolve tie among snipers using Global Stats (Daily Wins)
     if len(snipers_list) == 1:
         holder_sniper = snipers_list[0]
     else:
-        # Filter stats for these players
          sniper_stats = stats[stats.index.isin(snipers_list)]
-         holder_sniper = resolve_tie(sniper_stats, "Daily Wins") # Fallback to wins if strokes tied
+         holder_sniper = resolve_tie(sniper_stats, "Daily Wins")
     
     if holder_sniper != "Tied" and holder_sniper:
         if holder_sniper in stats.index:
@@ -352,7 +351,6 @@ with tab_submit:
                     group_scores = [{'name': d['name'], 'score': d['score']} for d in input_data]
                     new_rows = []
                     
-                    # Update Handicaps & Data
                     for d in input_data:
                         # 1. Calc RP
                         rp, note = calculate_standard_rp(d['score'], hl, d['cl'], d['rw'], d['ho'], group_scores, d['name'], current_rp_map)
@@ -368,9 +366,8 @@ with tab_submit:
                             "rp_earned": rp, "notes": note, "match_type": "Standard"
                         })
                     
-                    # Save Rounds
+                    # Update DB
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
-                    # Save Handicaps
                     conn.update(worksheet="players", data=df_players, spreadsheet=SPREADSHEET_NAME)
                     
                     st.cache_data.clear()
