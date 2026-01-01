@@ -128,19 +128,15 @@ if not df_rounds.empty:
             if r["match_type"] in ["Standard", "Duel"]:
                 stats.at[p, "Rounds"] += 1
 
-    # Avg & Best Gross (Standard OR Duel, 18H)
+    # Avg & Best Gross
     valid_18 = df_rounds[
         (df_rounds["holes_played"] == "18") & 
         (df_rounds["match_type"].isin(["Standard", "Duel"]))
     ]
     if not valid_18.empty:
-        # Avg (Stableford) - Only Standard usually counts for Avg, but user said 1v1 counts for sniper. Keeping Avg to Standard/Duel is safer.
-        # Actually user said "Sniper... from standard and 1v1". He didn't specify Avg. Usually Avg is Standard only.
-        # Let's keep Avg to Standard+Duel to be consistent with "Rounds Played"
         avg = valid_18.groupby("player_name")["stableford_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
         
-        # Best Gross
         gross_recs = valid_18[valid_18["gross_score"] > 0]
         if not gross_recs.empty:
             best = gross_recs.groupby("player_name")["gross_score"].min()
@@ -162,27 +158,24 @@ if not df_rounds.empty:
             stats.at[p, "2v2 Record"] = f"{int(w.get(p,0))}-{int(t.get(p,0))}-{int(l.get(p,0))}"
     
     # Daily Wins
-    # Standard
     std_only = df_rounds[df_rounds["match_type"] == "Standard"]
     for (d, c), g in std_only.groupby(["date", "course"]):
         if not g.empty:
             m = g["stableford_score"].max()
             for winner in g[g["stableford_score"] == m]["player_name"].unique():
                 if winner in stats.index: stats.at[winner, "Daily Wins"] += 1
-    # Duels
+    
     for winner in duels[duels["rp_earned"] > 0]["player_name"]:
         if winner in stats.index: stats.at[winner, "Daily Wins"] += 1
 
-# --- 2. TROPHY LOGIC (UPDATED RULES) ---
+# --- 2. TROPHY LOGIC ---
 holder_rock, holder_sniper, holder_conq = None, None, None
 
-# Rock: Best Avg (Min 3 Rounds)
 q_rock = stats[stats["Rounds"] >= 3].sort_values("Avg Score", ascending=False)
 if not q_rock.empty:
     holder_rock = q_rock.index[0]
     stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
 
-# Sniper: Lowest Gross (Month) - Standard OR Duel (18H)
 curr = datetime.date.today()
 m_rnds = df_rounds[
     (df_rounds["date"].dt.month == curr.month) & 
@@ -198,8 +191,6 @@ if not m_rnds.empty:
         holder_sniper = s_list[0]
         stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
 
-# Conqueror: Most Wins (Min 3 Rounds)
-# Filter for Min 3 Rounds first
 eligible_conq = stats[stats["Rounds"] >= 3]
 if not eligible_conq.empty:
     q_conq = eligible_conq.sort_values(["Daily Wins", "Tournament 1 Ranking Points"], ascending=False)
@@ -207,7 +198,6 @@ if not eligible_conq.empty:
         holder_conq = q_conq.index[0]
         stats.at[holder_conq, "Tournament 1 Ranking Points"] += 10
 
-# Final Formatting
 stats["Avg Score"] = stats["Avg Score"].round(1)
 stats = stats.sort_values("Tournament 1 Ranking Points", ascending=False).reset_index()
 def decorate(row):
@@ -270,7 +260,6 @@ with tab_submit:
     if mode == "Standard Round":
         st.info("Submit scores for the group.")
         
-        # --- FIX: MULTISELECT OUTSIDE FORM TO PREVENT DISAPPEARING INPUTS ---
         selected_players = st.multiselect("Select Players", player_list)
         
         with st.form("std_form"):
@@ -289,9 +278,9 @@ with tab_submit:
                     gr = cb.number_input(f"Gross ({p})", 0, 150, key=f"g_{p}")
                     
                     bon = cc.columns(3)
-                    cl = bon[0].checkbox("Clean?", key=f"c_{p}")
-                    rw = bon[1].checkbox("New Crs?", key=f"r_{p}")
-                    ho = bon[2].checkbox("HIO?", key=f"h_{p}")
+                    cl = bon[0].checkbox("Clean Sheet", key=f"c_{p}")
+                    rw = bon[1].checkbox("New Course", key=f"r_{p}")
+                    ho = bon[2].checkbox("Hole in One", key=f"h_{p}")
                     input_data.append({'name':p, 'score':sf, 'gross':gr, 'cl':cl, 'rw':rw, 'ho':ho})
             
             if st.form_submit_button("Submit Scorecards"):
@@ -308,15 +297,18 @@ with tab_submit:
                             "rp_earned": rp, "notes": note, "match_type": "Standard"
                         })
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
-                    st.success(f"Saved!")
+                    st.cache_data.clear()
+                    st.success(f"Saved {len(players)} rounds!")
                     st.rerun()
 
     elif mode == "The Duel (1v1)":
+        # MOVED PLAYER SELECTORS OUTSIDE FORM TO FIX REFRESH BUG
+        st.warning("⚔️ **1v1 STAKES**")
+        c1, c2 = st.columns(2)
+        p1 = c1.selectbox("P1", player_list)
+        p2 = c2.selectbox("P2", player_list, index=1 if len(player_list)>1 else 0)
+        
         with st.form("duel_form"):
-            st.warning("⚔️ **1v1 STAKES**")
-            c1, c2 = st.columns(2)
-            p1 = c1.selectbox("P1", player_list)
-            p2 = c2.selectbox("P2", player_list, index=1)
             winner = st.radio("Winner:", [p1, p2], horizontal=True)
             
             c3, c4, c5 = st.columns(3)
@@ -343,18 +335,22 @@ with tab_submit:
                         {"date":str(dt), "course":crs, "player_name":lose_p, "holes_played":hl, "gross_score":(g2 if win_p==p1 else g1), "rp_earned": base-steal, "notes":l_note, "match_type":"Duel"}
                     ]
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+                    st.cache_data.clear()
                     st.success("Duel Saved!")
                     st.rerun()
 
     elif mode == "The Alliance (2v2)":
+        # MOVED SELECTORS OUTSIDE FORM
+        c1, c2 = st.columns(2)
+        w1 = c1.selectbox("Win 1", player_list, key="w1")
+        w2 = c1.selectbox("Win 2", player_list, key="w2")
+        l1 = c2.selectbox("Lose 1", player_list, key="l1")
+        l2 = c2.selectbox("Lose 2", player_list, key="l2")
+        
         with st.form("ally_form"):
-            c1, c2 = st.columns(2)
-            w1 = c1.selectbox("Win 1", player_list, key="w1")
-            w2 = c1.selectbox("Win 2", player_list, key="w2")
-            wh = c1.number_input("Holes", 0, 18, key="wh")
-            l1 = c2.selectbox("Lose 1", player_list, key="l1")
-            l2 = c2.selectbox("Lose 2", player_list, key="l2")
-            lh = c2.number_input("Holes", 0, 18, key="lh")
+            c_h1, c_h2 = st.columns(2)
+            wh = c_h1.number_input("Win Holes", 0, 18)
+            lh = c_h2.number_input("Lose Holes", 0, 18)
             
             dt = st.date_input("Date")
             crs = st.text_input("Course")
@@ -362,7 +358,6 @@ with tab_submit:
             if st.form_submit_button("Submit 2v2"):
                 rows = []
                 def is_debut(p):
-                    # Check if player has any Alliance matches before today
                     past = df_rounds[(df_rounds["player_name"]==p) & (df_rounds["match_type"]=="Alliance")]
                     return len(past) == 0
 
@@ -379,6 +374,7 @@ with tab_submit:
                     rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": -5+bonus, "notes":note, "match_type":"Alliance"})
                 
                 conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+                st.cache_data.clear()
                 st.success("Alliance Saved!")
                 st.rerun()
 
@@ -404,9 +400,7 @@ with tab_history:
                 
                 col_s, col_d = st.columns([1, 4])
                 if col_s.button("Save", key=f"s_{d}_{c}_{t}"):
-                    # Drop old by index
                     df_rounds = df_rounds.drop(g.index)
-                    # Create new from edited
                     save_df = edited.copy()
                     save_df["date"] = pd.to_datetime(d)
                     save_df["course"] = c
@@ -415,12 +409,14 @@ with tab_history:
                     
                     df_rounds = pd.concat([df_rounds, save_df], ignore_index=True)
                     conn.update(worksheet="rounds", data=df_rounds, spreadsheet=SPREADSHEET_NAME)
+                    st.cache_data.clear()
                     st.success("Updated!")
                     st.rerun()
                     
                 if col_d.button("Delete Match", key=f"d_{d}_{c}_{t}"):
                     df_rounds = df_rounds.drop(g.index)
                     conn.update(worksheet="rounds", data=df_rounds, spreadsheet=SPREADSHEET_NAME)
+                    st.cache_data.clear()
                     st.error("Deleted!")
                     st.rerun()
 
@@ -434,11 +430,13 @@ with tab_admin:
         h = st.number_input("Handicap", 0.0)
         if st.form_submit_button("Add"):
             conn.update(worksheet="players", data=pd.concat([df_players, pd.DataFrame([{"name":n, "handicap":h}])], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+            st.cache_data.clear()
             st.rerun()
     with st.form("del_p"):
         d = st.selectbox("Delete", player_list)
         if st.form_submit_button("Delete"):
             conn.update(worksheet="players", data=df_players[df_players["name"]!=d], spreadsheet=SPREADSHEET_NAME)
+            st.cache_data.clear()
             st.rerun()
 
 # =========================================================
