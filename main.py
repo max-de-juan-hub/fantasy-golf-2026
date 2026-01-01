@@ -105,38 +105,33 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 df_players, df_rounds = load_data(conn)
 player_list = df_players["name"].tolist() if not df_players.empty else []
 
-# --- 1. STATS ENGINE (CORRECTED) ---
+# --- 1. STATS ENGINE ---
 stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
 for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: stats[c] = 0
 stats["2v2 Record"] = "0-0-0"
 current_rp_map = {}
 
 if not df_rounds.empty:
-    # 1. Total RP & Map
     total_rp = df_rounds.groupby("player_name")["rp_earned"].sum()
     stats["Tournament 1 Ranking Points"] = stats["Tournament 1 Ranking Points"].add(total_rp, fill_value=0)
     for p, val in total_rp.items(): current_rp_map[p] = val
 
-    # 2. Season RP
     df_rounds["season"] = df_rounds["date"].apply(get_season)
     season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
     for s in ["Season 1", "Season 2"]:
         if s in season_rp.columns: stats[s] = stats[s].add(season_rp[s], fill_value=0)
 
-    # 3. ROUNDS PLAYED (Standard + Duel + Alliance)
-    # Count ALL matches
+    # Rounds Played (All types)
     rounds_count = df_rounds.groupby("player_name").size()
     stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
 
-    # 4. AVG SCORE (Standard Only)
-    # 1v1 and 2v2 do NOT track Stableford score usually (it's 0), so we exclude them from Avg calculation
+    # Avg Score (Standard Only)
     std_matches = df_rounds[df_rounds["match_type"] == "Standard"]
     if not std_matches.empty:
         avg = std_matches.groupby("player_name")["stableford_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
 
-    # 5. BEST GROSS (Standard + Duel 18H)
-    # Only counts if gross_score > 0
+    # Best Gross (Standard + Duel 18H)
     valid_gross = df_rounds[
         (df_rounds["holes_played"] == "18") & 
         (df_rounds["match_type"].isin(["Standard", "Duel"])) & 
@@ -147,26 +142,20 @@ if not df_rounds.empty:
         for p, val in best.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
-    # 6. DAILY WINS (Standard + Duel + Alliance)
-    
-    # A. Standard Wins (Max Stableford in Batch)
+    # Daily Wins (All types)
     if not std_matches.empty:
-        # Group by Batch ID to find winner of that specific group
         for mid, group in std_matches.groupby("match_id"):
             max_s = group["stableford_score"].max()
             winners = group[group["stableford_score"] == max_s]["player_name"].unique()
             for w in winners:
                 if w in stats.index: stats.at[w, "Daily Wins"] += 1
     
-    # B. Duel/Alliance Wins (Any Positive RP is a Win)
-    # In Duel/Alliance: Winners get +pts, Losers get -pts.
     non_std = df_rounds[df_rounds["match_type"].isin(["Duel", "Alliance"])]
     if not non_std.empty:
         winners = non_std[non_std["rp_earned"] > 0]["player_name"]
         for w in winners:
             if w in stats.index: stats.at[w, "Daily Wins"] += 1
 
-    # 7. RECORDS (Display Only)
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
         w = duels[duels["rp_earned"] > 0].groupby("player_name").size()
@@ -190,18 +179,15 @@ def resolve_tie(cand, metric):
     best_val = cand[metric].min() if metric == "Best Gross" else cand[metric].max()
     tied = cand[cand[metric] == best_val]
     if len(tied) == 1: return tied.index[0]
-    # Tie-breaker: Daily Wins
     best_wins = tied["Daily Wins"].max()
     tied_wins = tied[tied["Daily Wins"] == best_wins]
     return tied_wins.index[0] if len(tied_wins) == 1 else "Tied"
 
-# Rock (Best Avg, Min 3 Rounds)
 q_rock = stats[stats["Rounds"] >= 3]
 if not q_rock.empty:
     holder_rock = resolve_tie(q_rock, "Avg Score")
     if holder_rock != "Tied" and holder_rock: stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
 
-# Sniper (Month Best Gross)
 curr = datetime.date.today()
 m_rnds = df_rounds[
     (df_rounds["date"].dt.month == curr.month) & 
@@ -219,7 +205,6 @@ if not m_rnds.empty:
         holder_sniper = resolve_tie(s_stats, "Daily Wins")
     if holder_sniper != "Tied" and holder_sniper in stats.index: stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
 
-# Conqueror (Most Wins, Min 3 Rounds)
 q_conq = stats[stats["Rounds"] >= 3]
 if not q_conq.empty:
     holder_conq = resolve_tie(q_conq, "Daily Wins")
@@ -257,7 +242,13 @@ with tab_trophy:
     rv = stats[stats["player_name"] == holder_rock]["Avg Score"].values[0] if holder_rock and holder_rock != "Tied" else 0
     sv = min_g if holder_sniper and holder_sniper != "Tied" else 0
     cv = stats[stats["player_name"] == holder_conq]["Daily Wins"].values[0] if holder_conq and holder_conq != "Tied" else 0
+    
     st.markdown("""<style>.trophy-card { background-color: #262730; padding: 20px; border-radius: 10px; border: 1px solid #4B4B4B; text-align: center; } .t-icon { font-size: 40px; } .t-head { font-size: 18px; font-weight: bold; color: #FFD700; margin-top: 5px; } .t-sub { font-size: 12px; color: #A0A0A0; margin-bottom: 10px; } .t-name { font-size: 20px; font-weight: bold; color: white; } .t-bonus { color: #00FF00; font-weight: bold; font-size: 14px; margin-top: 5px; }</style>""", unsafe_allow_html=True)
+    
+    # DEFINE THE CARD FUNCTION HERE BEFORE CALLING IT
+    def card(c, i, t, d, w, b, r): 
+        c.markdown(f"""<div class="trophy-card"><div class="t-icon">{i}</div><div class="t-head">{t}</div><div class="t-sub">{d}<br><i>{r}</i></div><div class="t-name">{w}</div><div class="t-bonus">{b}</div></div>""", unsafe_allow_html=True)
+
     c1, c2, c3, c4 = st.columns(4)
     card(c1, "🪨", "The Rock", "Best Avg", txt(holder_rock, rv, "Avg"), "+10", "Min 3 Rounds")
     card(c2, "🚀", "The Rocket", "Biggest HCP Drop", "Unclaimed", "+10", "Min 3 Rounds")
@@ -429,7 +420,8 @@ with tab_admin:
 
 with tab_rules:
     st.header("📘 Official Rulebook 2026")
-    with st.expander("1. HOW WE PLAY (STABLEFORD)", expanded=True): st.markdown("**Stableford Scoring:**\n* **Golden Rule:** Play against your 'Personal Par' (Net Par).\n* **Points:** Albatross (5), Eagle (4), Birdie (3), Par (2), Bogey (1), Double+ (0).")
+    with st.expander("1. HOW WE PLAY (STABLEFORD)", expanded=True):
+        st.markdown("**Stableford Scoring:**\n* **Golden Rule:** Play against your 'Personal Par' (Net Par).\n* **Points:** Albatross (5), Eagle (4), Birdie (3), Par (2), Bogey (1), Double+ (0).")
     with st.expander("2. THE CALENDAR"): st.markdown("* **Tournament 1:** Jan 1 - Jun 20.\n* **Tournament 2:** Jul 1 - Dec 20.")
     with st.expander("3. PERFORMANCE RANKING (RP)"): st.markdown("**Target: 36 Pts (18H) | 18 Pts (9H)**\n* **Positive (>36):** (Score - 36) * 2 = RP Gained.\n* **Negative (<36):** (Score - 36) / 2 = RP Lost.")
     with st.expander("4. BONUSES & AWARDS"): st.markdown("**Match Bonuses:**\n* Part(+2), Win(+2-6), Slayer(+1), Clean(+2), Road(+2), HIO(+10).\n**Seasonal Awards:** Rock, Rocket, Sniper, Conqueror.")
