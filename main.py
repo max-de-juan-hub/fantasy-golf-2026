@@ -29,10 +29,12 @@ def load_data(conn):
         rounds["gross_score"] = rounds["gross_score"].fillna(0).astype(int)
         rounds["stableford_score"] = rounds["stableford_score"].fillna(0).astype(int)
         rounds["rp_earned"] = rounds["rp_earned"].fillna(0).astype(int)
-        rounds["date"] = pd.to_datetime(rounds["date"])
+        # Convert date safely
+        rounds["date"] = pd.to_datetime(rounds["date"], errors='coerce')
         
         return players, rounds
     except Exception as e:
+        # Fallback for empty/new sheet
         return pd.DataFrame(columns=["name", "handicap"]), pd.DataFrame(columns=["player_name", "rp_earned", "stableford_score", "date"])
 
 def calculate_rp(stableford, holes_played, clean_sheet=False, road_warrior=False, hio=False):
@@ -54,6 +56,7 @@ def calculate_rp(stableford, holes_played, clean_sheet=False, road_warrior=False
     return participation + perf + bonus
 
 def get_season(date_obj):
+    if pd.isnull(date_obj): return "Unknown"
     # Season 1: Jan 1 - Mar 31
     # Season 2: Apr 1 - Jun 20
     year = date_obj.year
@@ -87,14 +90,15 @@ if not df_rounds.empty:
     for idx, row in df_rounds.iterrows():
         p = row["player_name"]
         rp = row["rp_earned"]
-        season = get_season(row["date"])
-        
-        # Add to Total
-        if p in stats.index:
-            stats.at[p, "Tournament 1 Ranking Points"] += rp
-            # Add to Season Bucket
-            if season in stats.columns:
-                stats.at[p, season] += rp
+        # Ensure we have a valid date
+        if pd.notnull(row["date"]):
+            season = get_season(row["date"])
+            
+            # Add to Total & Season Bucket if player exists
+            if p in stats.index:
+                stats.at[p, "Tournament 1 Ranking Points"] += rp
+                if season in stats.columns:
+                    stats.at[p, season] += rp
 
     # B. Rounds Count
     r_count = df_rounds.groupby("player_name")["date"].count()
@@ -109,7 +113,6 @@ if not df_rounds.empty:
         # Best Gross (Valid rounds only)
         gross_r = std_rounds[std_rounds["gross_score"] > 0]
         if not gross_r.empty:
-            # We want MIN score, but fill_value=0 in add messes min up. Direct update is safer.
             best = gross_r.groupby("player_name")["gross_score"].min()
             for p, score in best.items():
                 if p in stats.index:
@@ -127,17 +130,16 @@ if not df_rounds.empty:
     allies = df_rounds[df_rounds["match_type"] == "Alliance"]
     if not allies.empty:
         a_wins = allies[allies["rp_earned"] > 0].groupby("player_name").size()
-        a_ties = allies[allies["rp_earned"] == 0].groupby("player_name").size() # Usually 0 RP implies tie if participation wasn't logged
+        a_ties = allies[allies["rp_earned"] == 0].groupby("player_name").size()
         a_loss = allies[allies["rp_earned"] < 0].groupby("player_name").size()
         
         for p in stats.index:
-            w = a_wins.get(p, 0)
-            t = a_ties.get(p, 0)
-            l = a_loss.get(p, 0)
+            w = int(a_wins.get(p, 0))
+            t = int(a_ties.get(p, 0))
+            l = int(a_loss.get(p, 0))
             stats.at[p, "2v2 Record"] = f"{w}-{t}-{l}"
             
     # F. Daily Wins
-    # Group by Date + Course -> Find Max Score -> Assign Win
     match_groups = std_rounds.groupby(["date", "course"])
     for _, group in match_groups:
         if not group.empty:
@@ -151,40 +153,35 @@ if not df_rounds.empty:
 holder_rock = None
 holder_sniper = None
 holder_conq = None
-holder_rocket = None # Manual
 
-# A. The Rock (+10 RP) - Best Avg
+# A. The Rock (+10 RP)
 qualified_rock = stats[stats["Rounds"] >= 5].sort_values("Avg Score", ascending=False)
 if not qualified_rock.empty:
     holder_rock = qualified_rock.index[0]
-    stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10 # ADD BONUS
+    stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
 
 # B. The Sniper (+5 RP) - Lowest Gross CURRENT MONTH
-current_month = datetime.date.today().month
-current_year = datetime.date.today().year
+today = datetime.date.today()
 month_rounds = df_rounds[
-    (df_rounds["date"].dt.month == current_month) & 
-    (df_rounds["date"].dt.year == current_year) &
+    (df_rounds["date"].dt.month == today.month) & 
+    (df_rounds["date"].dt.year == today.year) &
     (df_rounds["gross_score"] > 0) &
     (df_rounds["holes_played"] == "18")
 ]
-
+best_month_score = 0
 if not month_rounds.empty:
-    # Find lowest score
     best_month_score = month_rounds["gross_score"].min()
-    # Find player(s) with that score
     snipers = month_rounds[month_rounds["gross_score"] == best_month_score]["player_name"].unique()
     if len(snipers) > 0:
-        holder_sniper = snipers[0] # Tie-breaker: first logged (or add logic)
+        holder_sniper = snipers[0]
         if holder_sniper in stats.index:
-            stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5 # ADD BONUS
+            stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
 
-# C. The Conqueror (+10 RP) - Most Daily Wins
-# If ties, goes to most RP
+# C. The Conqueror (+10 RP)
 conq_sort = stats.sort_values(["Daily Wins", "Tournament 1 Ranking Points"], ascending=False)
 if not conq_sort.empty and conq_sort.iloc[0]["Daily Wins"] > 0:
     holder_conq = conq_sort.index[0]
-    stats.at[holder_conq, "Tournament 1 Ranking Points"] += 10 # ADD BONUS
+    stats.at[holder_conq, "Tournament 1 Ranking Points"] += 10
 
 # Clean Up
 stats["Avg Score"] = stats["Avg Score"].round(1)
@@ -226,13 +223,13 @@ with tab_leaderboard:
 
     def highlight_rows(row):
         if row.name == 0:
-            return ['background-color: #FFA500; color: black'] * len(row) # Orange Leader
+            return ['background-color: #FFA500; color: black'] * len(row) 
         elif 1 <= row.name <= 3:
-            return ['background-color: #FFFFE0; color: black'] * len(row) # Yellow Top 4
+            return ['background-color: #FFFFE0; color: black'] * len(row)
         return [''] * len(row)
 
     st.dataframe(
-        view.style.apply(highlight_rows, axis=1).format({"Handicap": "{:.0f}"}), # Int formatting
+        view.style.apply(highlight_rows, axis=1).format({"Handicap": "{:.0f}"}), 
         use_container_width=True,
         hide_index=True
     )
@@ -250,13 +247,9 @@ with tab_trophy:
         return f"{holder}\n\n*({val} {label})*" if holder else "Unclaimed"
 
     rock_val = stats[stats["player_name"] == holder_rock]["Avg Score"].values[0] if holder_rock else 0
-    
-    # Sniper val needs to come from month logic
     snip_val = best_month_score if holder_sniper else 0
-    
     conq_val = stats[stats["player_name"] == holder_conq]["Daily Wins"].values[0] if holder_conq else 0
 
-    # CSS Cards
     st.markdown("""
     <style>
     .trophy-card { background-color: #262730; padding: 20px; border-radius: 10px; border: 1px solid #4B4B4B; text-align: center; }
@@ -371,19 +364,19 @@ with tab_submit:
                 st.rerun()
 
 # =========================================================
-# TAB 4: HISTORY (NEW!)
+# TAB 4: HISTORY
 # =========================================================
 with tab_history:
     st.header("📜 Round History Management")
     st.info("Expand a round to view details, edit scores, or delete entries.")
     
     if not df_rounds.empty:
-        # Sort by date descending
+        # Sort by date
         history_df = df_rounds.sort_values("date", ascending=False).reset_index(drop=True)
         
         for i, row in history_df.iterrows():
-            # Create a label for the expander
-            label = f"{row['date'].strftime('%Y-%m-%d')} | {row['player_name']} | {row['course']} | {row['rp_earned']} RP"
+            d_str = row['date'].strftime('%Y-%m-%d') if pd.notnull(row['date']) else "No Date"
+            label = f"{d_str} | {row['player_name']} | {row['course']} | {row['rp_earned']} RP"
             
             with st.expander(label):
                 with st.form(f"edit_{i}"):
@@ -397,27 +390,31 @@ with tab_history:
                     delete = col_del.form_submit_button("🗑️ DELETE ROUND", type="primary")
                     
                     if update:
-                        # Find original index in main DF to update
-                        # This works because we iterate, but safer to match by all fields if possible. 
-                        # Since we don't have IDs, we assume chronological sort holds or reload.
-                        # Simplified: We reload, find the row, update.
-                        # Recalculate RP
                         new_rp = calculate_rp(new_score, row['holes_played'], "Clean" in new_notes, "Road" in new_notes, "HIO" in new_notes)
+                        # Identify row to update (simple logic)
+                        # We use index matching from sorted df to original df if indices preserved, but here we scan
+                        # Safer: Just append "UPDATED" note or try to match fields. 
+                        # For simple app: Delete old, add new is easiest way to 'update' without unique IDs
                         
-                        # Update logic (Matching by timestamp/player/course is safest without ID)
-                        mask = (df_rounds['date'] == row['date']) & (df_rounds['player_name'] == row['player_name']) & (df_rounds['course'] == row['course'])
-                        df_rounds.loc[mask, 'stableford_score'] = new_score
-                        df_rounds.loc[mask, 'gross_score'] = new_gross
-                        df_rounds.loc[mask, 'notes'] = new_notes
-                        df_rounds.loc[mask, 'rp_earned'] = new_rp
+                        # Better way:
+                        df_rounds.loc[
+                            (df_rounds['date'] == row['date']) & 
+                            (df_rounds['player_name'] == row['player_name']) & 
+                            (df_rounds['course'] == row['course']) &
+                            (df_rounds['rp_earned'] == row['rp_earned']), 
+                            ['stableford_score', 'gross_score', 'notes', 'rp_earned']
+                        ] = [new_score, new_gross, new_notes, new_rp]
                         
                         conn.update(worksheet="rounds", data=df_rounds, spreadsheet=SPREADSHEET_NAME)
                         st.success("Updated!")
                         st.rerun()
                         
                     if delete:
-                        mask = (df_rounds['date'] == row['date']) & (df_rounds['player_name'] == row['player_name']) & (df_rounds['course'] == row['course'])
-                        df_rounds = df_rounds[~mask]
+                        df_rounds = df_rounds.drop(df_rounds[
+                            (df_rounds['date'] == row['date']) & 
+                            (df_rounds['player_name'] == row['player_name']) & 
+                            (df_rounds['course'] == row['course'])
+                        ].index)
                         conn.update(worksheet="rounds", data=df_rounds, spreadsheet=SPREADSHEET_NAME)
                         st.error("Deleted!")
                         st.rerun()
@@ -446,16 +443,16 @@ with tab_admin:
 # TAB 6: RULEBOOK
 # =========================================================
 with tab_rules:
-    [cite_start]st.header("📘 Official Rulebook [cite: 1]")
+    st.header("📘 Official Rulebook")
     
     with st.expander("1. HOW WE PLAY (STABLEFORD)", expanded=True):
         st.markdown("""
-        [cite_start]**We use Stableford Scoring. [cite: 9, 10]**
-        * **The Golden Rule:** "Your Personal Par". Forget the "Course Par." [cite_start]You play against your Personal Par (Net Par). [cite: 11, 12]
-        * [cite_start]**Handicap:** Gives you extra shots on difficult holes. [cite: 13]
-        * [cite_start]**Example:** 1 handicap stroke on a Par 4 = Personal Par 5. Shooting a 5 = Par (2 pts). [cite: 14]
+        **We use Stableford Scoring.**
+        * **The Golden Rule:** "Your Personal Par". Forget the "Course Par." You play against your Personal Par (Net Par).
+        * **Handicap:** Gives you extra shots on difficult holes.
+        * **Example:** 1 handicap stroke on a Par 4 = Personal Par 5. Shooting a 5 = Par (2 pts).
         
-        [cite_start]**Points System: [cite: 16, 17]**
+        **Points System:**
         * **Albatross (3 under):** 5 Points
         * **Eagle (2 under):** 4 Points
         * **Birdie (1 under):** 3 Points
@@ -463,89 +460,89 @@ with tab_rules:
         * **Bogey (1 over):** 1 Point
         * **Double Bogey or worse:** 0 Points
         
-        *Note: No "gimmes". [cite_start]Finish your hole. [cite: 18]*
+        *Note: No "gimmes". Finish your hole.*
         """)
 
-    [cite_start]with st.expander("2. THE CALENDAR [cite: 19]"):
+    with st.expander("2. THE CALENDAR"):
         st.markdown("""
-        [cite_start]**Tournament 1: The Road to the King (Jan - Jun) [cite: 20]**
-        * [cite_start]**Season 1 (Summer):** Jan 1 - Mar 31 [cite: 21]
-        * [cite_start]**Season 2 (Fall):** Apr 1 - Jun 20 [cite: 21]
-        * **Special Event:** The King's Cup (June 21 - 30). [cite_start]*Qualification: Top 4.* [cite: 22, 23]
+        **Tournament 1: The Road to the King (Jan - Jun)**
+        * **Season 1 (Summer):** Jan 1 - Mar 31
+        * **Season 2 (Fall):** Apr 1 - Jun 20
+        * **Special Event:** The King's Cup (June 21 - 30). *Qualification: Top 4.*
         
-        [cite_start]**Tournament 2: The Road to Glory (Jul - Dec) [cite: 24]**
-        * [cite_start]*League Points Reset to 0.* [cite: 25]
-        * [cite_start]**Season 3 (Winter):** Jul 1 - Sep 30 [cite: 27]
-        * [cite_start]**Season 4 (Spring):** Oct 1 - Dec 20 [cite: 28]
-        * [cite_start]**Grand Finals:** Dec 21 - 31. *Qualification: Top from T1 & T2 + King's Cup Champ.* [cite: 29, 30]
+        **Tournament 2: The Road to Glory (Jul - Dec)**
+        * *League Points Reset to 0.*
+        * **Season 3 (Winter):** Jul 1 - Sep 30
+        * **Season 4 (Spring):** Oct 1 - Dec 20
+        * **Grand Finals:** Dec 21 - 31. *Qualification: Top from T1 & T2 + King's Cup Champ.*
         """)
 
-    [cite_start]with st.expander("3. PERFORMANCE RANKING (RP) [cite: 31]"):
+    with st.expander("3. PERFORMANCE RANKING (RP)"):
         st.markdown("""
-        [cite_start]**Target Score:** 36 Points (18H) | 18 Points (9H) [cite: 32, 47]
+        **Target Score:** 36 Points (18H) | 18 Points (9H)
         
-        **1. [cite_start]Positive Score (Score > 36) - "Double Down" [cite: 34]**
-        * [cite_start]Formula: `(Score - 36) x 2 = RP Earned` [cite: 35]
-        * [cite_start]*Example: 40 pts -> +8 RP.* [cite: 38]
+        **1. Positive Score (Score > 36) - "Double Down"**
+        * Formula: `(Score - 36) x 2 = RP Earned`
+        * *Example: 40 pts -> +8 RP.*
         
-        **2. [cite_start]Negative Score (Score < 36) [cite: 39]**
-        * [cite_start]Formula: `(Score - 36) / 2 = RP Deducted` [cite: 40]
-        * [cite_start]*Example: 27 pts -> -5 RP.* [cite: 43]
+        **2. Negative Score (Score < 36)**
+        * Formula: `(Score - 36) / 2 = RP Deducted`
+        * *Example: 27 pts -> -5 RP.*
         
-        **3. [cite_start]The Sprint Protocol (9-Hole Rounds) [cite: 44]**
-        * [cite_start]Goal: 18 Pts. [cite: 47]
-        * [cite_start]Participation: +1 RP. [cite: 48]
-        * [cite_start]*Restrictions: No Clean Sheet or Sniper.* [cite: 49]
+        **3. The Sprint Protocol (9-Hole Rounds)**
+        * Goal: 18 Pts.
+        * Participation: +1 RP.
+        * *Restrictions: No Clean Sheet or Sniper.*
         """)
 
-    [cite_start]with st.expander("4. BONUSES & AWARDS [cite: 50]"):
+    with st.expander("4. BONUSES & AWARDS"):
         st.markdown("""
-        [cite_start]**Match Bonuses [cite: 51]**
-        * [cite_start]**Participation:** +2 RP (18H), +1 RP (9H). [cite: 54]
-        * [cite_start]**Winner of the Day:** +2 to +6 RP (Group size dependent). [cite: 55]
-        * [cite_start]**Giant Slayer:** +1 RP per higher-ranked player beaten. [cite: 56]
-        * [cite_start]**Clean Sheets:** +2 RP (No "0 pt" holes). [cite: 57]
-        * [cite_start]**Road Warrior:** +2 RP (New Course). [cite: 58]
-        * [cite_start]**Hole-in-One:** +10 RP. [cite: 59]
+        **Match Bonuses**
+        * **Participation:** +2 RP (18H), +1 RP (9H).
+        * **Winner of the Day:** +2 to +6 RP (Group size dependent).
+        * **Giant Slayer:** +1 RP per higher-ranked player beaten.
+        * **Clean Sheets:** +2 RP (No "0 pt" holes).
+        * **Road Warrior:** +2 RP (New Course).
+        * **Hole-in-One:** +10 RP.
         
-        [cite_start]**Seasonal Awards [cite: 60]**
-        * [cite_start]**The Rock (+10 RP):** Best Scoring Average (Min 5 rounds). [cite: 63]
-        * [cite_start]**The Rocket (+10 RP):** Biggest Handicap reduction. [cite: 64]
-        * [cite_start]**The Conqueror (+10 RP):** League Leader. [cite: 65]
-        * [cite_start]**The Sniper (+5 RP):** Best Gross Score (Monthly). [cite: 66]
+        **Seasonal Awards**
+        * **The Rock (+10 RP):** Best Scoring Average (Min 5 rounds).
+        * **The Rocket (+10 RP):** Biggest Handicap reduction.
+        * **The Conqueror (+10 RP):** League Leader.
+        * **The Sniper (+5 RP):** Best Gross Score (Monthly).
         
-        [cite_start]**The Checkpoint Podium [cite: 67]**
-        * [cite_start]End of Season 1 Top 5 Bonus: 1st (+15), 2nd (+10), 3rd (+7), 4th (+4), 5th (+2). [cite: 70]
+        **The Checkpoint Podium**
+        * End of Season 1 Top 5 Bonus: 1st (+15), 2nd (+10), 3rd (+7), 4th (+4), 5th (+2).
         """)
 
-    [cite_start]with st.expander("5. RIVALRY CHALLENGES [cite: 71]"):
+    with st.expander("5. RIVALRY CHALLENGES"):
         st.markdown("""
-        [cite_start]**The Alliance (2v2) [cite: 73]**
-        * [cite_start]**Format:** Texas Scramble / Match Play. [cite: 74]
-        * [cite_start]**Scoring:** Winners steal points. [cite: 77]
-        * [cite_start]**Victory:** +5 RP per player. [cite: 79]
-        * [cite_start]**Defeat:** -5 RP per player. [cite: 80]
+        **The Alliance (2v2)**
+        * **Format:** Texas Scramble / Match Play.
+        * **Scoring:** Winners steal points.
+        * **Victory:** +5 RP per player.
+        * **Defeat:** -5 RP per player.
         
-        [cite_start]**The Duel (1v1 Scratch) [cite: 84]**
-        * [cite_start]**Format:** Gross Stroke Play (No Handicaps). [cite: 85]
-        * [cite_start]**Standard Stakes:** Favorite Wins (+5 RP), Loser (-5 RP). [cite: 89]
-        * [cite_start]**Upset Stakes:** Underdog Wins (+10 RP). [cite: 90]
+        **The Duel (1v1 Scratch)**
+        * **Format:** Gross Stroke Play (No Handicaps).
+        * **Standard Stakes:** Favorite Wins (+5 RP), Loser (-5 RP).
+        * **Upset Stakes:** Underdog Wins (+10 RP).
         """)
 
-    [cite_start]with st.expander("6. LIVE HANDICAPS [cite: 92]"):
+    with st.expander("6. LIVE HANDICAPS"):
         st.markdown("""
-        [cite_start]**Automatic Adjustments (HCP <= 36) [cite: 97]**
-        * [cite_start]**40+ pts:** -2.0 [cite: 98]
-        * [cite_start]**37-39 pts:** -1.0 [cite: 99]
-        * [cite_start]**27-36 pts:** No Change [cite: 100]
-        * [cite_start]**<27 pts:** +1.0 [cite: 101]
+        **Automatic Adjustments (HCP <= 36)**
+        * **40+ pts:** -2.0
+        * **37-39 pts:** -1.0
+        * **27-36 pts:** No Change
+        * **<27 pts:** +1.0
         
-        [cite_start]**Sandbagger Protocol (HCP > 36) [cite: 102]**
+        **Sandbagger Protocol (HCP > 36)**
         * Cut 1.0 stroke per point over 36.
         
-        [cite_start]**Away Game Protocol [cite: 103]**
+        **Away Game Protocol**
         * Par 70+ courses:
-        * [cite_start]HCP 0-10: +3 Shots [cite: 107]
-        * [cite_start]HCP 11-20: +5 Shots [cite: 107]
-        * [cite_start]HCP 21+: +7 Shots [cite: 108]
+        * HCP 0-10: +3 Shots
+        * HCP 11-20: +5 Shots
+        * HCP 21+: +7 Shots
         """)
