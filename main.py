@@ -59,10 +59,14 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 df_players, df_rounds = load_data(conn)
 player_list = df_players["name"].tolist() if not df_players.empty else []
 
-# --- GLOBAL CALCULATIONS (For Leaderboard & Trophies) ---
-# Create a base Stats DataFrame with ALL players (Left Join)
+# --- GLOBAL CALCULATIONS (Safe Version) ---
+# Create a base Stats DataFrame with ALL players
 stats = df_players.copy()
 stats = stats.rename(columns={"name": "player_name"})
+
+# Initialize missing columns with 0 to prevent KeyError if no rounds exist
+for col in ["rp_earned", "date", "avg_score", "best_gross", "2v2_wins", "2v2_losses"]:
+    stats[col] = 0
 
 if not df_rounds.empty:
     # 1. Total RP and Rounds
@@ -70,36 +74,50 @@ if not df_rounds.empty:
         "rp_earned": "sum",
         "date": "count"
     }).reset_index()
-    stats = stats.merge(group_stats, on="player_name", how="left")
+    # Update stats safely
+    stats.set_index("player_name", inplace=True)
+    group_stats.set_index("player_name", inplace=True)
+    stats.update(group_stats)
+    stats.reset_index(inplace=True)
     
     # 2. Avg Score & Best Round (18H Only)
     std_rounds = df_rounds[df_rounds["holes_played"] == "18"]
     if not std_rounds.empty:
         # Avg Score
         avg_scores = std_rounds.groupby("player_name")["stableford_score"].mean().reset_index()
-        avg_scores.columns = ["player_name", "avg_score"]
-        stats = stats.merge(avg_scores, on="player_name", how="left")
+        avg_scores.set_index("player_name", inplace=True)
+        stats.set_index("player_name", inplace=True)
+        stats.update(avg_scores.rename(columns={"stableford_score": "avg_score"}))
+        stats.reset_index(inplace=True)
         
-        # Best Gross (Lowest Strokes)
+        # Best Gross
         best_gross = std_rounds[std_rounds["gross_score"] > 0].groupby("player_name")["gross_score"].min().reset_index()
-        best_gross.columns = ["player_name", "best_gross"]
-        stats = stats.merge(best_gross, on="player_name", how="left")
+        best_gross.set_index("player_name", inplace=True)
+        stats.set_index("player_name", inplace=True)
+        stats.update(best_gross.rename(columns={"gross_score": "best_gross"}))
+        stats.reset_index(inplace=True)
     
-    # 3. 2v2 Record (Wins-Losses)
-    # This is a simple approximation based on RP. >0 in Alliance = Win.
+    # 3. 2v2 Record
     alliance_rounds = df_rounds[df_rounds["match_type"] == "Alliance"]
     if not alliance_rounds.empty:
         wins = alliance_rounds[alliance_rounds["rp_earned"] > 0].groupby("player_name").size().reset_index(name="2v2_wins")
         losses = alliance_rounds[alliance_rounds["rp_earned"] < 0].groupby("player_name").size().reset_index(name="2v2_losses")
-        stats = stats.merge(wins, on="player_name", how="left").merge(losses, on="player_name", how="left")
+        
+        stats.set_index("player_name", inplace=True)
+        wins.set_index("player_name", inplace=True)
+        losses.set_index("player_name", inplace=True)
+        
+        stats.update(wins)
+        stats.update(losses)
+        stats.reset_index(inplace=True)
 
-# Fill NaNs
+# Final formatting
 stats["rp_earned"] = stats["rp_earned"].fillna(0).astype(int)
 stats["date"] = stats["date"].fillna(0).astype(int)
 stats["avg_score"] = stats["avg_score"].fillna(0.0).round(1)
 stats["best_gross"] = stats["best_gross"].fillna(0).astype(int)
-stats["2v2_wins"] = stats.get("2v2_wins", pd.Series([0]*len(stats))).fillna(0).astype(int)
-stats["2v2_losses"] = stats.get("2v2_losses", pd.Series([0]*len(stats))).fillna(0).astype(int)
+stats["2v2_wins"] = stats["2v2_wins"].fillna(0).astype(int)
+stats["2v2_losses"] = stats["2v2_losses"].fillna(0).astype(int)
 
 # Create "Record" String
 stats["2v2 Record"] = stats["2v2_wins"].astype(str) + "-" + stats["2v2_losses"].astype(str) + "-0"
@@ -111,7 +129,7 @@ stats = stats.sort_values("rp_earned", ascending=False).reset_index(drop=True)
 st.title("🏆 Fantasy Golf 2026")
 st.markdown("*The Official League App.*")
 
-# --- TABS LAYOUT (Correct Order) ---
+# --- TABS LAYOUT ---
 tab_leaderboard, tab_trophy, tab_submit, tab_admin, tab_rules = st.tabs([
     "🌍 Leaderboard", 
     "🏆 Trophy Room", 
@@ -121,18 +139,17 @@ tab_leaderboard, tab_trophy, tab_submit, tab_admin, tab_rules = st.tabs([
 ])
 
 # =========================================================
-# TAB 1: LEADERBOARD (Full Grid)
+# TAB 1: LEADERBOARD
 # =========================================================
 with tab_leaderboard:
     st.header("Live Standings")
     
-    # Format for display
     display_df = stats[[
         "player_name", "rp_earned", "handicap", "best_gross", "date", "avg_score", "2v2 Record"
     ]].copy()
     
-    # Add dummy cols for design match
-    display_df["Daily Wins"] = 0 # Placeholder for now
+    # Placeholder for Daily Wins (requires complex tracking, can add later)
+    display_df["Daily Wins"] = 0 
     
     st.dataframe(
         display_df,
@@ -151,28 +168,23 @@ with tab_leaderboard:
     )
 
 # =========================================================
-# TAB 2: TROPHY ROOM (Visual Upgrades)
+# TAB 2: TROPHY ROOM
 # =========================================================
 with tab_trophy:
     st.header("🏆 The Hall of Fame")
     
     # -- Logic --
-    # Rock: Best Avg (Min 5 rounds)
     rock_cand = stats[stats["date"] >= 5].sort_values("avg_score", ascending=False)
     rock_txt = f"{rock_cand.iloc[0]['player_name']} ({rock_cand.iloc[0]['avg_score']})" if not rock_cand.empty else "Unclaimed"
     
-    # Rocket: Most Improved (Placeholder logic - needs historic tracking, currently showing Leader)
     rocket_txt = "Unclaimed"
     
-    # Sniper: Lowest Gross
     sniper_cand = stats[stats["best_gross"] > 0].sort_values("best_gross", ascending=True)
     sniper_txt = f"{sniper_cand.iloc[0]['player_name']} ({sniper_cand.iloc[0]['best_gross']})" if not sniper_cand.empty else "Unclaimed"
     
-    # Conqueror: Most RP
     conq_txt = f"{stats.iloc[0]['player_name']}" if not stats.empty else "Unclaimed"
 
     # -- Visual Cards --
-    # CSS for cards
     st.markdown("""
     <style>
     .trophy-card {
@@ -222,18 +234,15 @@ with tab_submit:
     if game_mode == "🏌️ Standard Round":
         st.info("Log scores for yourself or the group.")
         
-        # 1. SELECT PLAYERS OUTSIDE THE FORM
         selected_players = st.multiselect("Select Players in Group", player_list)
         
         if selected_players:
             with st.form("standard_form"):
-                # Global Settings
                 c1, c2, c3 = st.columns(3)
                 date_play = c1.date_input("Date", datetime.date.today())
                 course = c2.text_input("Course Name", value="Chinderah")
                 holes = c3.radio("Length", ["18", "9"], horizontal=True)
                 
-                # Dynamic Inputs
                 st.subheader("Scorecards")
                 player_data = []
                 for p in selected_players:
@@ -302,14 +311,10 @@ with tab_submit:
                 if winner == loser:
                     st.error("Select different players.")
                 else:
-                    # Participation RP (+2 or +1)
                     part_rp = 1 if holes == "9" else 2
-                    
-                    # Theft RP
                     steal_win = 10 if "Upset" in stake_type else 5
                     steal_lose = -5
                     
-                    # Total RP
                     w_rp = part_rp + steal_win
                     l_rp = part_rp + steal_lose
                     
@@ -333,7 +338,6 @@ with tab_submit:
             st.divider()
             
             col_win, col_lose = st.columns(2)
-            
             with col_win:
                 st.success("🏆 THE WINNERS (+5 RP)")
                 w1 = st.selectbox("Partner 1", player_list, key="w1")
@@ -349,7 +353,6 @@ with tab_submit:
             if st.form_submit_button("Submit Alliance Match"):
                 rows = []
                 note = f"Result: {w_holes}-{l_holes}"
-                # Participation (+2) + Win/Loss
                 part = 2
                 
                 for p in [w1, w2]:
@@ -387,7 +390,6 @@ with tab_admin:
             confirm = st.text_input("Type 'DELETE' to confirm")
             if st.form_submit_button("Permanently Delete"):
                 if confirm == "DELETE":
-                    # Remove from players DF
                     clean_players = df_players[df_players["name"] != to_del]
                     conn.update(worksheet="players", data=clean_players, spreadsheet=SPREADSHEET_NAME)
                     st.error(f"Deleted {to_del}")
