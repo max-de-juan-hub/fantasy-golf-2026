@@ -27,12 +27,17 @@ def load_data(conn):
         players = conn.read(worksheet="players", spreadsheet=SPREADSHEET_NAME, ttl=0)
         rounds = conn.read(worksheet="rounds", spreadsheet=SPREADSHEET_NAME, ttl=0)
     except Exception as e:
-        st.error(f"Connection Error: {e}")
+        st.warning(f"Connection Note: {e}")
         return pd.DataFrame(), pd.DataFrame()
     
     # 1. Player Data Safety
-    if "handicap" not in players.columns: players["handicap"] = 0.0
-    if "start_handicap" not in players.columns: players["start_handicap"] = players["handicap"]
+    if players.empty:
+        players = pd.DataFrame(columns=["name", "handicap", "start_handicap"])
+    
+    for req in ["name", "handicap", "start_handicap"]:
+        if req not in players.columns:
+            if req == "name": players[req] = pd.Series(dtype='str')
+            else: players[req] = 0.0
 
     # 2. Round Data Safety
     defaults = {
@@ -40,10 +45,14 @@ def load_data(conn):
         "notes": "", "stableford_score": 0, "rp_earned": 0, "course": "Unknown",
         "date": str(datetime.date.today()), "match_id": "legacy"
     }
+    
+    if rounds.empty:
+        rounds = pd.DataFrame(columns=list(defaults.keys()) + ["player_name"])
+
     for col, val in defaults.items():
         if col not in rounds.columns: rounds[col] = val
 
-    # FORCE TYPE CONVERSION
+    # Force Types
     rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str).str.replace(".0", "", regex=False)
     rounds["match_id"] = rounds["match_id"].astype(str).replace("nan", "legacy")
     
@@ -67,6 +76,41 @@ def calculate_new_handicap(current_hcp, score):
         elif score >= 37: return max(0.0, current_hcp - 1.0)
         elif score < 27: return current_hcp + 1.0
         else: return current_hcp
+
+# --- CRITICAL: REPLAY HISTORY ENGINE ---
+def recalculate_all_handicaps(df_rounds, df_players):
+    """
+    Resets everyone to start_handicap, then replays every round chronologically
+    to calculate the true current handicap.
+    """
+    # 1. Reset all handicaps to start_handicap
+    # Create a map for fast lookup: {player_name: current_hcp}
+    hcp_map = {}
+    for idx, row in df_players.iterrows():
+        hcp_map[row["name"]] = row["start_handicap"]
+        
+    # 2. Sort rounds by date (Oldest to Newest)
+    if not df_rounds.empty:
+        sorted_rounds = df_rounds.sort_values("date", ascending=True)
+        
+        # 3. Replay History
+        for idx, row in sorted_rounds.iterrows():
+            if row["match_type"] == "Standard":
+                p_name = row["player_name"]
+                score = row["stableford_score"]
+                
+                # Only calc if player exists in map
+                if p_name in hcp_map:
+                    old_hcp = hcp_map[p_name]
+                    new_hcp = calculate_new_handicap(old_hcp, score)
+                    hcp_map[p_name] = new_hcp
+    
+    # 4. Update dataframe
+    for idx, row in df_players.iterrows():
+        if row["name"] in hcp_map:
+            df_players.at[idx, "handicap"] = hcp_map[row["name"]]
+            
+    return df_players
 
 def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, current_player, player_rp_map):
     breakdown = []
@@ -108,9 +152,6 @@ def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, c
 def get_season(date_obj):
     if pd.isnull(date_obj): return "Unknown"
     y, d = date_obj.year, date_obj.date()
-    # Season 1: Jan 1 - Jun 20 (Per Rulebook - T1 consists of S1+S2 actually?)
-    # Wait, Rulebook says: T1 (Jan-Jun) split into S1(Jan-Mar) and S2(Apr-Jun)
-    # Correcting ranges:
     if datetime.date(y, 1, 1) <= d <= datetime.date(y, 3, 31): return "Season 1"
     if datetime.date(y, 4, 1) <= d <= datetime.date(y, 6, 20): return "Season 2"
     return "Off-Season"
@@ -121,20 +162,17 @@ df_players, df_rounds = load_data(conn)
 player_list = df_players["name"].tolist() if not df_players.empty else []
 
 # --- 1. STATS ENGINE ---
-stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
-cols = [
-    "Tournament 1 Ranking Points", "Season 1", "Season 2", 
-    "Bonus RP S1", "Bonus RP S2",
-    "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"
-]
-for c in cols: stats[c] = 0
-stats["2v2 Record"] = "0-0-0"
+if df_players.empty:
+    stats = pd.DataFrame()
+else:
+    stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
+    for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Bonus RP S1", "Bonus RP S2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: 
+        stats[c] = 0
+    stats["2v2 Record"] = "0-0-0"
 
 current_rp_map = {}
 
-if not df_rounds.empty:
-    # 1. Base RP (Before Bonuses)
-    # We calculate Base RP from rounds first
+if not df_rounds.empty and not stats.empty:
     df_rounds["season"] = df_rounds["date"].apply(get_season)
     season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
     
@@ -142,17 +180,14 @@ if not df_rounds.empty:
         if s in season_rp.columns: 
             stats[s] = stats[s].add(season_rp[s], fill_value=0)
 
-    # 2. Rounds Played
     rounds_count = df_rounds.groupby("player_name").size()
     stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
 
-    # 3. Avg Score (Standard)
     std_matches = df_rounds[df_rounds["match_type"] == "Standard"]
     if not std_matches.empty:
         avg = std_matches.groupby("player_name")["stableford_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
 
-    # 4. Best Gross (Month)
     curr = datetime.date.today()
     month_rnds = df_rounds[
         (df_rounds["date"].dt.month == curr.month) & 
@@ -166,7 +201,6 @@ if not df_rounds.empty:
         for p, val in best_month.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
-    # 5. Daily Wins
     if not std_matches.empty:
         for mid, group in std_matches.groupby("match_id"):
             max_s = group["stableford_score"].max()
@@ -180,7 +214,6 @@ if not df_rounds.empty:
         for w in winners:
             if w in stats.index: stats.at[w, "Daily Wins"] += 1
 
-    # 6. Records
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
         w = duels[duels["rp_earned"] > 0].groupby("player_name").size()
@@ -196,12 +229,10 @@ if not df_rounds.empty:
         for p in stats.index:
             stats.at[p, "2v2 Record"] = f"{int(w.get(p,0))}-{int(t.get(p,0))}-{int(l.get(p,0))}"
 
-# --- 2. TROPHY LOGIC (BONUS RP) ---
+# --- 2. TROPHY LOGIC ---
 holder_rock, holder_sniper, holder_conq, holder_rocket = None, None, None, None
 
-# Determine current bonus column based on date
 current_season_col = "Bonus RP S1" if get_season(datetime.datetime.now()) == "Season 1" else "Bonus RP S2"
-# Fallback if off-season (default to S2 or S1? Let's default S1 for Jan)
 if get_season(datetime.datetime.now()) == "Off-Season": current_season_col = "Bonus RP S1" 
 
 def resolve_tie(cand, metric):
@@ -223,49 +254,43 @@ def award_bonus(holder, points):
     if holder and holder != "Tied" and holder in stats.index:
         stats.at[holder, current_season_col] += points
 
-# Rock
-q_rock = stats[stats["Rounds"] >= 3]
-if not q_rock.empty:
-    holder_rock = resolve_tie(q_rock, "Avg Score")
-    award_bonus(holder_rock, 10)
+if not stats.empty:
+    q_rock = stats[stats["Rounds"] >= 3]
+    if not q_rock.empty:
+        holder_rock = resolve_tie(q_rock, "Avg Score")
+        award_bonus(holder_rock, 10)
 
-# Rocket
-stats["HCP Reduction"] = stats.apply(lambda row: df_players.loc[df_players["name"]==row.name, "start_handicap"].values[0] - row["handicap"] if row.name in df_players["name"].values else 0, axis=1)
-q_rocket = stats[stats["Rounds"] >= 3]
-if not q_rocket.empty:
-    q_rocket = q_rocket[q_rocket["HCP Reduction"] > 0]
+    stats["HCP Reduction"] = stats.apply(lambda row: df_players.loc[df_players["name"]==row.name, "start_handicap"].values[0] - row["handicap"] if row.name in df_players["name"].values else 0, axis=1)
+    q_rocket = stats[stats["Rounds"] >= 3]
     if not q_rocket.empty:
-        holder_rocket = resolve_tie(q_rocket, "HCP Reduction")
-        award_bonus(holder_rocket, 10)
+        q_rocket = q_rocket[q_rocket["HCP Reduction"] > 0]
+        if not q_rocket.empty:
+            holder_rocket = resolve_tie(q_rocket, "HCP Reduction")
+            award_bonus(holder_rocket, 10)
 
-# Sniper
-q_sniper = stats[stats["Best Gross"] > 0]
-if not q_sniper.empty:
-    holder_sniper = resolve_tie(q_sniper, "Best Gross")
-    award_bonus(holder_sniper, 5)
+    q_sniper = stats[stats["Best Gross"] > 0]
+    if not q_sniper.empty:
+        holder_sniper = resolve_tie(q_sniper, "Best Gross")
+        award_bonus(holder_sniper, 5)
 
-# Conqueror
-q_conq = stats[stats["Rounds"] >= 3]
-if not q_conq.empty:
-    holder_conq = resolve_tie(q_conq, "Daily Wins")
-    award_bonus(holder_conq, 10)
+    q_conq = stats[stats["Rounds"] >= 3]
+    if not q_conq.empty:
+        holder_conq = resolve_tie(q_conq, "Daily Wins")
+        award_bonus(holder_conq, 10)
 
-# 3. FINAL SUM (Total = S1 + S1Bonus + S2 + S2Bonus)
-stats["Tournament 1 Ranking Points"] = stats["Season 1"] + stats["Bonus RP S1"] + stats["Season 2"] + stats["Bonus RP S2"]
+    stats["Tournament 1 Ranking Points"] = stats["Season 1"] + stats["Bonus RP S1"] + stats["Season 2"] + stats["Bonus RP S2"]
+    
+    for p, val in stats["Tournament 1 Ranking Points"].items(): current_rp_map[p] = val
 
-# Populate Map for Slayer
-for p, val in stats["Tournament 1 Ranking Points"].items(): current_rp_map[p] = val
-
-# Formatting
-stats = stats.sort_values("Tournament 1 Ranking Points", ascending=False).reset_index()
-def decorate(row):
-    n, i = row["player_name"], ""
-    if n == holder_rock: i += " 🪨"
-    if n == holder_sniper: i += " 🎯"
-    if n == holder_conq: i += " 👑"
-    if n == holder_rocket: i += " 🚀"
-    return f"{n}{i}"
-stats["Player"] = stats.apply(decorate, axis=1)
+    stats = stats.sort_values("Tournament 1 Ranking Points", ascending=False).reset_index()
+    def decorate(row):
+        n, i = row["player_name"], ""
+        if n == holder_rock: i += " 🪨"
+        if n == holder_sniper: i += " 🎯"
+        if n == holder_conq: i += " 👑"
+        if n == holder_rocket: i += " 🚀"
+        return f"{n}{i}"
+    stats["Player"] = stats.apply(decorate, axis=1)
 
 # --- UI ---
 st.title("🏆 Fantasy Golf 2026")
@@ -273,168 +298,164 @@ tab_leaderboard, tab_trophy, tab_submit, tab_history, tab_admin, tab_rules = st.
 
 with tab_leaderboard:
     st.header("Live Standings")
-    v = stats.copy()
-    v["1v1 Record"] = v["1v1 Wins"].astype(int).astype(str) + "-" + v["1v1 Losses"].astype(int).astype(str)
-    
-    v = v.rename(columns={
-        "handicap": "Handicap", 
-        "Best Gross": "Best Round", 
-        "Avg Score": "Average Stableford", 
-        "Rounds": "Rounds Played",
-        "Season 1": "Season 1 RP",
-        "Season 2": "Season 2 RP"
-    })
-    
-    cols_order = [
-        "Player", "Tournament 1 Ranking Points", "Handicap", "Daily Wins", 
-        "Best Round", "Average Stableford", "Rounds Played", "1v1 Record", 
-        "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2"
-    ]
-    final_cols = [c for c in cols_order if c in v.columns]
-    v = v[final_cols]
+    if stats.empty:
+        st.info("👋 Welcome! No players found. Go to the 'Admin' tab to add players.")
+    else:
+        v = stats.copy()
+        v["1v1 Record"] = v["1v1 Wins"].astype(int).astype(str) + "-" + v["1v1 Losses"].astype(int).astype(str)
+        v = v.rename(columns={"handicap": "Handicap", "Best Gross": "Best Round", "Avg Score": "Average Stableford", "Rounds": "Rounds Played", "Season 1": "Season 1 RP", "Season 2": "Season 2 RP"})
+        
+        cols_order = ["Player", "Tournament 1 Ranking Points", "Handicap", "Daily Wins", "Best Round", "Average Stableford", "Rounds Played", "1v1 Record", "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2"]
+        final_cols = [c for c in cols_order if c in v.columns]
+        v = v[final_cols]
 
-    for col in v.columns:
-        if col not in ["Player", "1v1 Record", "2v2 Record"]:
-            v[col] = v[col].apply(fmt_num)
+        for col in v.columns:
+            if col not in ["Player", "1v1 Record", "2v2 Record"]:
+                v[col] = v[col].apply(fmt_num)
 
-    def color_row(row):
-        if row.name == 0: return ['background-color: #FFA500; color: black'] * len(row)
-        if 1 <= row.name <= 3: return ['background-color: #FFFFE0; color: black'] * len(row)
-        return [''] * len(row)
+        def color_row(row):
+            if row.name == 0: return ['background-color: #FFA500; color: black'] * len(row)
+            if 1 <= row.name <= 3: return ['background-color: #FFFFE0; color: black'] * len(row)
+            return [''] * len(row)
 
-    st.dataframe(v.style.apply(color_row, axis=1), use_container_width=True, hide_index=True)
-    st.caption("🔶 **Orange:** Leader | 🟡 **Yellow:** Top 4 | 🏆 **Bonuses:** 🪨 Rock(+10) 🎯 Sniper(+5) 👑 Conqueror(+10) 🚀 Rocket(+10)")
+        st.dataframe(v.style.apply(color_row, axis=1), use_container_width=True, hide_index=True)
+        st.caption("🔶 **Orange:** Leader | 🟡 **Yellow:** Top 4 | 🏆 **Bonuses:** 🪨 Rock(+10) 🎯 Sniper(+5) 👑 Conqueror(+10) 🚀 Rocket(+10)")
 
 with tab_trophy:
     st.header("🏆 The Hall of Fame")
-    def txt(h, v, l): 
-        if h == "Tied": return "TIED\n*(Head-to-Head)*"
-        return f"{h}\n\n*({fmt_num(v)} {l})*" if h else "Unclaimed"
-    
-    def get_val(holder, metric):
-        if not holder or holder == "Tied": return 0
-        val = stats.loc[stats["player_name"] == holder, metric]
-        return val.values[0] if not val.empty else 0
+    if stats.empty:
+        st.info("Add players to see awards.")
+    else:
+        def txt(h, v, l): 
+            if h == "Tied": return "TIED\n*(Head-to-Head)*"
+            return f"{h}\n\n*({fmt_num(v)} {l})*" if h else "Unclaimed"
+        
+        def get_val(holder, metric):
+            if not holder or holder == "Tied": return 0
+            val = stats.loc[stats["player_name"] == holder, metric]
+            return val.values[0] if not val.empty else 0
 
-    rv = get_val(holder_rock, "Avg Score")
-    sv = get_val(holder_sniper, "Best Gross")
-    cv = get_val(holder_conq, "Daily Wins")
-    rkv = get_val(holder_rocket, "HCP Reduction")
-    
-    st.markdown("""<style>.trophy-card { background-color: #262730; padding: 20px; border-radius: 10px; border: 1px solid #4B4B4B; text-align: center; } .t-icon { font-size: 40px; } .t-head { font-size: 18px; font-weight: bold; color: #FFD700; margin-top: 5px; } .t-sub { font-size: 12px; color: #A0A0A0; margin-bottom: 10px; } .t-name { font-size: 20px; font-weight: bold; color: white; } .t-bonus { color: #00FF00; font-weight: bold; font-size: 14px; margin-top: 5px; }</style>""", unsafe_allow_html=True)
-    
-    def card(c, i, t, d, w, b, r): 
-        c.markdown(f"""<div class="trophy-card"><div class="t-icon">{i}</div><div class="t-head">{t}</div><div class="t-sub">{d}<br><i>{r}</i></div><div class="t-name">{w}</div><div class="t-bonus">{b}</div></div>""", unsafe_allow_html=True)
+        rv = get_val(holder_rock, "Avg Score")
+        sv = get_val(holder_sniper, "Best Gross")
+        cv = get_val(holder_conq, "Daily Wins")
+        rkv = get_val(holder_rocket, "HCP Reduction")
+        
+        st.markdown("""<style>.trophy-card { background-color: #262730; padding: 20px; border-radius: 10px; border: 1px solid #4B4B4B; text-align: center; } .t-icon { font-size: 40px; } .t-head { font-size: 18px; font-weight: bold; color: #FFD700; margin-top: 5px; } .t-sub { font-size: 12px; color: #A0A0A0; margin-bottom: 10px; } .t-name { font-size: 20px; font-weight: bold; color: white; } .t-bonus { color: #00FF00; font-weight: bold; font-size: 14px; margin-top: 5px; }</style>""", unsafe_allow_html=True)
+        def card(c, i, t, d, w, b, r): 
+            c.markdown(f"""<div class="trophy-card"><div class="t-icon">{i}</div><div class="t-head">{t}</div><div class="t-sub">{d}<br><i>{r}</i></div><div class="t-name">{w}</div><div class="t-bonus">{b}</div></div>""", unsafe_allow_html=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    card(c1, "🪨", "The Rock", "Best Avg", txt(holder_rock, rv, "Avg"), "+10", "Min 3 Rounds")
-    card(c2, "🚀", "The Rocket", "Biggest HCP Drop", txt(holder_rocket, rkv, "Drop"), "+10", "Min 3 Rounds")
-    card(c3, "🎯", "The Sniper", "Best Gross (Month)", txt(holder_sniper, sv, "Strks"), "+5", "Std or 1v1 (18H)")
-    card(c4, "👑", "The Conqueror", "Most Wins", txt(holder_conq, cv, "Wins"), "+10", "Min 3 Rounds")
+        c1, c2, c3, c4 = st.columns(4)
+        card(c1, "🪨", "The Rock", "Best Avg", txt(holder_rock, rv, "Avg"), "+10", "Min 3 Rounds")
+        card(c2, "🚀", "The Rocket", "Biggest HCP Drop", txt(holder_rocket, rkv, "Drop"), "+10", "Min 3 Rounds")
+        card(c3, "🎯", "The Sniper", "Best Gross (Month)", txt(holder_sniper, sv, "Strks"), "+5", "Std or 1v1 (18H)")
+        card(c4, "👑", "The Conqueror", "Most Wins", txt(holder_conq, cv, "Wins"), "+10", "Min 3 Rounds")
 
 with tab_submit:
     st.subheader("Choose Game Mode")
-    mode = st.radio("Format:", ["Standard Round", "The Duel (1v1)", "The Alliance (2v2)"], horizontal=True, label_visibility="collapsed")
-    
-    if mode == "Standard Round":
-        st.info("Submit scores for the group.")
-        selected_players = st.multiselect("Select Players", player_list)
-        with st.form("std_form"):
-            st.divider()
-            c1, c2, c3 = st.columns(3)
-            dt = c1.date_input("Date", datetime.date.today())
-            crs = c2.text_input("Course", "Chinderah")
-            hl = c3.radio("Length", ["18", "9"], horizontal=True)
-            input_data = []
-            if selected_players:
-                for p in selected_players:
-                    st.markdown(f"**{p}**")
-                    ca, cb, cc = st.columns([1, 1, 2])
-                    sf = ca.number_input(f"Stableford ({p})", 0, 60, key=f"s_{p}")
-                    gr = cb.number_input(f"Gross ({p})", 0, 150, key=f"g_{p}")
-                    bon = cc.columns(3)
-                    cl = bon[0].checkbox("Clean Sheet", key=f"c_{p}")
-                    rw = bon[1].checkbox("New Course", key=f"r_{p}")
-                    ho = bon[2].checkbox("Hole in One", key=f"h_{p}")
-                    input_data.append({'name':p, 'score':sf, 'gross':gr, 'cl':cl, 'rw':rw, 'ho':ho})
-            if st.form_submit_button("Submit Scorecards"):
-                if not selected_players: st.error("Select players first.")
-                else:
-                    batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
-                    group_scores = [{'name': d['name'], 'score': d['score']} for d in input_data]
-                    new_rows = []
-                    for d in input_data:
-                        rp, note = calculate_standard_rp(d['score'], hl, d['cl'], d['rw'], d['ho'], group_scores, d['name'], current_rp_map)
-                        curr_hcp = df_players.loc[df_players["name"] == d['name'], "handicap"].values[0]
-                        new_hcp = calculate_new_handicap(curr_hcp, d['score'])
-                        df_players.loc[df_players["name"] == d['name'], "handicap"] = new_hcp
-                        new_rows.append({"date": str(dt), "course": crs, "player_name": d['name'], "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], "rp_earned": rp, "notes": note, "match_type": "Standard", "match_id": batch_id})
-                    conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
-                    conn.update(worksheet="players", data=df_players, spreadsheet=SPREADSHEET_NAME)
-                    st.cache_data.clear()
-                    st.success(f"Saved {len(selected_players)} rounds! Handicaps updated.")
-                    st.rerun()
+    if player_list:
+        mode = st.radio("Format:", ["Standard Round", "The Duel (1v1)", "The Alliance (2v2)"], horizontal=True, label_visibility="collapsed")
+        
+        if mode == "Standard Round":
+            st.info("Submit scores for the group.")
+            selected_players = st.multiselect("Select Players", player_list)
+            with st.form("std_form"):
+                st.divider()
+                c1, c2, c3 = st.columns(3)
+                dt = c1.date_input("Date", datetime.date.today())
+                crs = c2.text_input("Course", "Chinderah")
+                hl = c3.radio("Length", ["18", "9"], horizontal=True)
+                input_data = []
+                if selected_players:
+                    for p in selected_players:
+                        st.markdown(f"**{p}**")
+                        ca, cb, cc = st.columns([1, 1, 2])
+                        sf = ca.number_input(f"Stableford ({p})", 0, 60, key=f"s_{p}")
+                        gr = cb.number_input(f"Gross ({p})", 0, 150, key=f"g_{p}")
+                        bon = cc.columns(3)
+                        cl = bon[0].checkbox("Clean Sheet", key=f"c_{p}")
+                        rw = bon[1].checkbox("New Course", key=f"r_{p}")
+                        ho = bon[2].checkbox("Hole in One", key=f"h_{p}")
+                        input_data.append({'name':p, 'score':sf, 'gross':gr, 'cl':cl, 'rw':rw, 'ho':ho})
+                if st.form_submit_button("Submit Scorecards"):
+                    if not selected_players: st.error("Select players first.")
+                    else:
+                        batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
+                        group_scores = [{'name': d['name'], 'score': d['score']} for d in input_data]
+                        new_rows = []
+                        for d in input_data:
+                            rp, note = calculate_standard_rp(d['score'], hl, d['cl'], d['rw'], d['ho'], group_scores, d['name'], current_rp_map)
+                            curr_hcp = df_players.loc[df_players["name"] == d['name'], "handicap"].values[0]
+                            new_hcp = calculate_new_handicap(curr_hcp, d['score'])
+                            df_players.loc[df_players["name"] == d['name'], "handicap"] = new_hcp
+                            new_rows.append({"date": str(dt), "course": crs, "player_name": d['name'], "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], "rp_earned": rp, "notes": note, "match_type": "Standard", "match_id": batch_id})
+                        conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+                        conn.update(worksheet="players", data=df_players, spreadsheet=SPREADSHEET_NAME)
+                        st.cache_data.clear()
+                        st.success(f"Saved {len(selected_players)} rounds! Handicaps updated.")
+                        st.rerun()
 
-    elif mode == "The Duel (1v1)":
-        c1, c2 = st.columns(2)
-        p1 = c1.selectbox("P1", player_list)
-        p2 = c2.selectbox("P2", player_list, index=1 if len(player_list)>1 else 0)
-        with st.form("duel_form"):
-            winner = st.radio("Winner:", [p1, p2], horizontal=True)
-            c3, c4, c5 = st.columns(3)
-            dt = c3.date_input("Date")
-            crs = c4.text_input("Course", "Chinderah")
-            hl = c5.radio("L", ["18", "9"], horizontal=True)
-            st.divider()
-            c6, c7 = st.columns(2)
-            g1 = c6.number_input(f"{p1} Gross", 0)
-            g2 = c7.number_input(f"{p2} Gross", 0)
-            stake = st.radio("Type", ["Standard (+5/-5)", "Upset (+10/-10)"])
-            if st.form_submit_button("Record Duel"):
-                if p1 == p2: st.error("Same player selected.")
-                else:
+        elif mode == "The Duel (1v1)":
+            c1, c2 = st.columns(2)
+            p1 = c1.selectbox("P1", player_list)
+            p2 = c2.selectbox("P2", player_list, index=1 if len(player_list)>1 else 0)
+            with st.form("duel_form"):
+                winner = st.radio("Winner:", [p1, p2], horizontal=True)
+                c3, c4, c5 = st.columns(3)
+                dt = c3.date_input("Date")
+                crs = c4.text_input("Course", "Chinderah")
+                hl = c5.radio("L", ["18", "9"], horizontal=True)
+                st.divider()
+                c6, c7 = st.columns(2)
+                g1 = c6.number_input(f"{p1} Gross", 0)
+                g2 = c7.number_input(f"{p2} Gross", 0)
+                stake = st.radio("Type", ["Standard (+5/-5)", "Upset (+10/-10)"])
+                if st.form_submit_button("Record Duel"):
+                    if p1 == p2: st.error("Same player selected.")
+                    else:
+                        batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
+                        win_p, lose_p = winner, (p2 if winner == p1 else p1)
+                        steal = 10 if "Upset" in stake else 5
+                        base = 1 if hl=="9" else 2
+                        w_note = f"Part(+{base}), Duel Win(+{steal})"
+                        l_note = f"Part(+{base}), Duel Loss(-{steal})"
+                        rows = [{"date":str(dt), "course":crs, "player_name":win_p, "holes_played":hl, "gross_score":(g1 if win_p==p1 else g2), "rp_earned": base+steal, "notes":w_note, "match_type":"Duel", "match_id": batch_id}, {"date":str(dt), "course":crs, "player_name":lose_p, "holes_played":hl, "gross_score":(g2 if win_p==p1 else g1), "rp_earned": base-steal, "notes":l_note, "match_type":"Duel", "match_id": batch_id}]
+                        conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+                        st.cache_data.clear()
+                        st.success("Duel Saved!")
+                        st.rerun()
+
+        elif mode == "The Alliance (2v2)":
+            c1, c2 = st.columns(2)
+            w1 = c1.selectbox("Win 1", player_list, key="w1")
+            w2 = c1.selectbox("Win 2", player_list, key="w2")
+            l1 = c2.selectbox("Lose 1", player_list, key="l1")
+            l2 = c2.selectbox("Lose 2", player_list, key="l2")
+            with st.form("ally_form"):
+                c_h1, c_h2 = st.columns(2)
+                wh = c_h1.number_input("Win Holes", 0, 18)
+                lh = c_h2.number_input("Lose Holes", 0, 18)
+                dt = st.date_input("Date")
+                crs = st.text_input("Course")
+                if st.form_submit_button("Submit 2v2"):
+                    rows = []
                     batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
-                    win_p, lose_p = winner, (p2 if winner == p1 else p1)
-                    steal = 10 if "Upset" in stake else 5
-                    base = 1 if hl=="9" else 2
-                    w_note = f"Part(+{base}), Duel Win(+{steal})"
-                    l_note = f"Part(+{base}), Duel Loss(-{steal})"
-                    rows = [{"date":str(dt), "course":crs, "player_name":win_p, "holes_played":hl, "gross_score":(g1 if win_p==p1 else g2), "rp_earned": base+steal, "notes":w_note, "match_type":"Duel", "match_id": batch_id}, {"date":str(dt), "course":crs, "player_name":lose_p, "holes_played":hl, "gross_score":(g2 if win_p==p1 else g1), "rp_earned": base-steal, "notes":l_note, "match_type":"Duel", "match_id": batch_id}]
+                    def is_debut(p): return len(df_rounds[(df_rounds["player_name"]==p) & (df_rounds["match_type"]=="Alliance")]) == 0
+                    for p in [w1, w2]: 
+                        bonus = 5 if is_debut(p) else 0
+                        note = f"Win ({wh}-{lh})"
+                        if bonus: note += ", Duo Debut(+5)"
+                        rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": 5+bonus, "notes":note, "match_type":"Alliance", "match_id": batch_id})
+                    for p in [l1, l2]:
+                        bonus = 5 if is_debut(p) else 0
+                        note = f"Loss ({wh}-{lh})"
+                        if bonus: note += ", Duo Debut(+5)"
+                        rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": -5+bonus, "notes":note, "match_type":"Alliance", "match_id": batch_id})
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
-                    st.success("Duel Saved!")
+                    st.success("Alliance Saved!")
                     st.rerun()
-
-    elif mode == "The Alliance (2v2)":
-        c1, c2 = st.columns(2)
-        w1 = c1.selectbox("Win 1", player_list, key="w1")
-        w2 = c1.selectbox("Win 2", player_list, key="w2")
-        l1 = c2.selectbox("Lose 1", player_list, key="l1")
-        l2 = c2.selectbox("Lose 2", player_list, key="l2")
-        with st.form("ally_form"):
-            c_h1, c_h2 = st.columns(2)
-            wh = c_h1.number_input("Win Holes", 0, 18)
-            lh = c_h2.number_input("Lose Holes", 0, 18)
-            dt = st.date_input("Date")
-            crs = st.text_input("Course")
-            if st.form_submit_button("Submit 2v2"):
-                rows = []
-                batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
-                def is_debut(p): return len(df_rounds[(df_rounds["player_name"]==p) & (df_rounds["match_type"]=="Alliance")]) == 0
-                for p in [w1, w2]: 
-                    bonus = 5 if is_debut(p) else 0
-                    note = f"Win ({wh}-{lh})"
-                    if bonus: note += ", Duo Debut(+5)"
-                    rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": 5+bonus, "notes":note, "match_type":"Alliance", "match_id": batch_id})
-                for p in [l1, l2]:
-                    bonus = 5 if is_debut(p) else 0
-                    note = f"Loss ({wh}-{lh})"
-                    if bonus: note += ", Duo Debut(+5)"
-                    rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": -5+bonus, "notes":note, "match_type":"Alliance", "match_id": batch_id})
-                conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
-                st.cache_data.clear()
-                st.success("Alliance Saved!")
-                st.rerun()
+    else:
+        st.warning("Please add players in the Admin tab to start submitting scores.")
 
 with tab_history:
     st.header("📜 League History")
@@ -463,32 +484,60 @@ with tab_history:
                     save_df = edited.copy()
                     t = g.iloc[0]
                     for c in ["date", "course", "match_type", "holes_played", "match_id"]: save_df[c] = t[c]
-                    conn.update(worksheet="rounds", data=pd.concat([df_rounds, save_df], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+                    
+                    # 1. Update Rounds DB
+                    new_rounds_db = pd.concat([df_rounds, save_df], ignore_index=True)
+                    conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
+                    
+                    # 2. Replay History to Fix Handicaps
+                    recalc_players = recalculate_all_handicaps(new_rounds_db, df_players)
+                    conn.update(worksheet="players", data=recalc_players, spreadsheet=SPREADSHEET_NAME)
+                    
                     st.cache_data.clear()
-                    st.success("Updated!")
+                    st.success("Updated & Handicaps Recalculated!")
                     st.rerun()
+                    
                 if col_d.button("Delete Match", key=f"d_{grp['key']}"):
-                    df_rounds = df_rounds.drop(g.index)
-                    conn.update(worksheet="rounds", data=df_rounds, spreadsheet=SPREADSHEET_NAME)
+                    # 1. Delete Round
+                    new_rounds_db = df_rounds.drop(g.index)
+                    conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
+                    
+                    # 2. Replay History
+                    recalc_players = recalculate_all_handicaps(new_rounds_db, df_players)
+                    conn.update(worksheet="players", data=recalc_players, spreadsheet=SPREADSHEET_NAME)
+                    
                     st.cache_data.clear()
-                    st.error("Deleted!")
+                    st.error("Deleted & Handicaps Recalculated!")
                     st.rerun()
 
 with tab_admin:
     st.header("⚙️ Admin")
-    with st.expander("⚠️ Season Management (Danger Zone)"):
-        st.warning("This will reset the 'Rocket Award' baseline. Use this ONLY at the start of a new season (e.g., July 1st).")
-        confirm_text = st.text_input("Type 'NEW SEASON' to confirm reset:")
-        if st.button("🚀 Start New Season (Reset Baselines)"):
-            if confirm_text == "NEW SEASON":
+    with st.expander("⚠️ Danger Zone (Reset)"):
+        st.warning("Use this to wipe ALL rounds and reset handicaps to their original start value (Day 1 Reset).")
+        confirm_reset = st.text_input("Type 'RESET LEAGUE' to wipe everything:")
+        if st.button("☢️ Factory Reset League"):
+            if confirm_reset == "RESET LEAGUE":
+                empty_rounds = pd.DataFrame(columns=["date", "course", "player_name", "holes_played", "gross_score", "stableford_score", "rp_earned", "notes", "match_type", "match_id"])
+                conn.update(worksheet="rounds", data=empty_rounds, spreadsheet=SPREADSHEET_NAME)
+                df_players["handicap"] = df_players["start_handicap"]
+                conn.update(worksheet="players", data=df_players, spreadsheet=SPREADSHEET_NAME)
+                st.cache_data.clear()
+                st.success("League Reset Complete!")
+                st.rerun()
+            else:
+                st.error("Type 'RESET LEAGUE' exactly.")
+
+    with st.expander("🚀 Season Management (New Season)"):
+        st.warning("Use this when Season 1 ends (e.g., July 1). It locks current handicaps as the new baseline.")
+        confirm = st.text_input("Type 'NEW SEASON' to confirm:")
+        if st.button("🚀 Start New Season"):
+            if confirm == "NEW SEASON":
                 df_players["start_handicap"] = df_players["handicap"]
                 conn.update(worksheet="players", data=df_players, spreadsheet=SPREADSHEET_NAME)
                 st.cache_data.clear()
-                st.success("Season Reset! Start handicaps updated.")
+                st.success("New Season Started!")
                 st.rerun()
-            else:
-                st.error("Please type 'NEW SEASON' exactly.")
-    
+
     st.write("### 🔍 Debug Data")
     with st.expander("Show Raw Data"):
         st.write(df_rounds)
