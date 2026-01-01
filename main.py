@@ -107,31 +107,38 @@ player_list = df_players["name"].tolist() if not df_players.empty else []
 
 # --- 1. STATS ENGINE ---
 stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
-for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: stats[c] = 0
+# Initialize all columns
+for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: 
+    stats[c] = 0
 stats["2v2 Record"] = "0-0-0"
+# Set Best Gross to a high number initially so min() works, or handle 0s later. 
+# Better: Keep 0, but filter > 0 when displaying/calculating.
+
 current_rp_map = {}
 
 if not df_rounds.empty:
+    # 1. Total RP & Map
     total_rp = df_rounds.groupby("player_name")["rp_earned"].sum()
     stats["Tournament 1 Ranking Points"] = stats["Tournament 1 Ranking Points"].add(total_rp, fill_value=0)
     for p, val in total_rp.items(): current_rp_map[p] = val
 
+    # 2. Season RP
     df_rounds["season"] = df_rounds["date"].apply(get_season)
     season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
     for s in ["Season 1", "Season 2"]:
         if s in season_rp.columns: stats[s] = stats[s].add(season_rp[s], fill_value=0)
 
-    # Rounds Played (All types)
+    # 3. ROUNDS PLAYED (Standard + Duel + Alliance)
     rounds_count = df_rounds.groupby("player_name").size()
     stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
 
-    # Avg Score (Standard Only)
+    # 4. AVG SCORE (Standard Only)
     std_matches = df_rounds[df_rounds["match_type"] == "Standard"]
     if not std_matches.empty:
         avg = std_matches.groupby("player_name")["stableford_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
 
-    # Best Gross (Standard + Duel 18H)
+    # 5. BEST GROSS (Standard + Duel 18H) - FIX: Use min() of > 0
     valid_gross = df_rounds[
         (df_rounds["holes_played"] == "18") & 
         (df_rounds["match_type"].isin(["Standard", "Duel"])) & 
@@ -142,7 +149,7 @@ if not df_rounds.empty:
         for p, val in best.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
-    # Daily Wins (All types)
+    # 6. DAILY WINS (Standard + Duel + Alliance)
     if not std_matches.empty:
         for mid, group in std_matches.groupby("match_id"):
             max_s = group["stableford_score"].max()
@@ -156,6 +163,7 @@ if not df_rounds.empty:
         for w in winners:
             if w in stats.index: stats.at[w, "Daily Wins"] += 1
 
+    # 7. RECORDS
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
         w = duels[duels["rp_earned"] > 0].groupby("player_name").size()
@@ -176,18 +184,30 @@ holder_rock, holder_sniper, holder_conq = None, None, None
 
 def resolve_tie(cand, metric):
     if len(cand) == 1: return cand.index[0]
-    best_val = cand[metric].min() if metric == "Best Gross" else cand[metric].max()
+    # For Gross, LOWER is better.
+    is_gross = (metric == "Best Gross")
+    # Filter non-zero for gross
+    if is_gross: 
+        cand = cand[cand[metric] > 0]
+        if cand.empty: return None
+        best_val = cand[metric].min()
+    else:
+        best_val = cand[metric].max()
+        
     tied = cand[cand[metric] == best_val]
     if len(tied) == 1: return tied.index[0]
+    
     best_wins = tied["Daily Wins"].max()
     tied_wins = tied[tied["Daily Wins"] == best_wins]
     return tied_wins.index[0] if len(tied_wins) == 1 else "Tied"
 
+# Rock (Avg Score, Min 3 Rounds)
 q_rock = stats[stats["Rounds"] >= 3]
 if not q_rock.empty:
     holder_rock = resolve_tie(q_rock, "Avg Score")
-    if holder_rock != "Tied" and holder_rock: stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
+    if holder_rock and holder_rock != "Tied": stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
 
+# Sniper (Month Best Gross) - Re-calc locally to ensure accuracy
 curr = datetime.date.today()
 m_rnds = df_rounds[
     (df_rounds["date"].dt.month == curr.month) & 
@@ -199,18 +219,22 @@ m_rnds = df_rounds[
 if not m_rnds.empty:
     min_g = m_rnds["gross_score"].min()
     s_list = m_rnds[m_rnds["gross_score"] == min_g]["player_name"].unique()
+    
     if len(s_list) == 1: holder_sniper = s_list[0]
     else: 
         s_stats = stats[stats.index.isin(s_list)]
         holder_sniper = resolve_tie(s_stats, "Daily Wins")
-    if holder_sniper != "Tied" and holder_sniper in stats.index: stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
+        
+    if holder_sniper and holder_sniper != "Tied" and holder_sniper in stats.index: 
+        stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
 
+# Conqueror (Most Wins, Min 3 Rounds)
 q_conq = stats[stats["Rounds"] >= 3]
 if not q_conq.empty:
     holder_conq = resolve_tie(q_conq, "Daily Wins")
-    if holder_conq != "Tied" and holder_conq: stats.at[holder_conq, "Tournament 1 Ranking Points"] += 10
+    if holder_conq and holder_conq != "Tied": stats.at[holder_conq, "Tournament 1 Ranking Points"] += 10
 
-stats["Avg Score"] = stats["Avg Score"].round(1)
+# Final Formatting
 stats = stats.sort_values("Tournament 1 Ranking Points", ascending=False).reset_index()
 def decorate(row):
     n, i = row["player_name"], ""
@@ -226,26 +250,65 @@ tab_leaderboard, tab_trophy, tab_submit, tab_history, tab_admin, tab_rules = st.
 
 with tab_leaderboard:
     st.header("Live Standings")
-    v = stats[["Player", "Tournament 1 Ranking Points", "Season 1", "Season 2", "handicap", "Best Gross", "Rounds", "Avg Score", "1v1 Wins", "1v1 Losses", "2v2 Record", "Daily Wins"]].copy()
+    
+    # Prepare Display Data
+    v = stats.copy()
     v["1v1 Record"] = v["1v1 Wins"].astype(int).astype(str) + "-" + v["1v1 Losses"].astype(int).astype(str)
-    v = v.drop(columns=["1v1 Wins", "1v1 Losses"]).rename(columns={"handicap": "Handicap", "Best Gross": "Best Round"})
+    
+    # RENAME & REORDER
+    # Desired: Player, T1, HCP, Daily Wins, Best Round, Avg Stableford, Rounds Played, 1v1, 2v2, S1, S2
+    v = v.rename(columns={
+        "handicap": "Handicap", 
+        "Best Gross": "Best Round", 
+        "Avg Score": "Average Stableford", 
+        "Rounds": "Rounds Played",
+        "Season 1": "Season 1 RP",
+        "Season 2": "Season 2 RP"
+    })
+    
+    cols_order = [
+        "Player", "Tournament 1 Ranking Points", "Handicap", "Daily Wins", 
+        "Best Round", "Average Stableford", "Rounds Played", "1v1 Record", 
+        "2v2 Record", "Season 1 RP", "Season 2 RP"
+    ]
+    
+    # Filter to existing cols just in case
+    final_cols = [c for c in cols_order if c in v.columns]
+    v = v[final_cols]
+
     def color_row(row):
         if row.name == 0: return ['background-color: #FFA500; color: black'] * len(row)
         if 1 <= row.name <= 3: return ['background-color: #FFFFE0; color: black'] * len(row)
         return [''] * len(row)
-    st.dataframe(v.style.apply(color_row, axis=1).format({"Handicap": "{:.0f}"}), use_container_width=True, hide_index=True)
+
+    st.dataframe(
+        v.style.apply(color_row, axis=1).format({
+            "Handicap": "{:.0f}", 
+            "Average Stableford": "{:.2f}",
+            "Best Round": "{:.0f}"
+        }), 
+        use_container_width=True, 
+        hide_index=True
+    )
     st.caption("🔶 **Orange:** Leader | 🟡 **Yellow:** Top 4 | 🏆 **Bonuses:** 🪨 Rock(+10) 🎯 Sniper(+5) 👑 Conqueror(+10)")
 
 with tab_trophy:
     st.header("🏆 The Hall of Fame")
     def txt(h, v, l): return "TIED\n*(Requires Head-to-Head)*" if h == "Tied" else (f"{h}\n\n*({v} {l})*" if h else "Unclaimed")
-    rv = stats[stats["player_name"] == holder_rock]["Avg Score"].values[0] if holder_rock and holder_rock != "Tied" else 0
+    
+    # Get Value safely
+    def get_val(holder, metric):
+        if not holder or holder == "Tied": return 0
+        val = stats.loc[stats["player_name"] == holder, metric]
+        return val.values[0] if not val.empty else 0
+
+    rv = get_val(holder_rock, "Average Stableford")
+    # For Sniper, we use the calculated month min, not season best
     sv = min_g if holder_sniper and holder_sniper != "Tied" else 0
-    cv = stats[stats["player_name"] == holder_conq]["Daily Wins"].values[0] if holder_conq and holder_conq != "Tied" else 0
+    cv = get_val(holder_conq, "Daily Wins")
     
     st.markdown("""<style>.trophy-card { background-color: #262730; padding: 20px; border-radius: 10px; border: 1px solid #4B4B4B; text-align: center; } .t-icon { font-size: 40px; } .t-head { font-size: 18px; font-weight: bold; color: #FFD700; margin-top: 5px; } .t-sub { font-size: 12px; color: #A0A0A0; margin-bottom: 10px; } .t-name { font-size: 20px; font-weight: bold; color: white; } .t-bonus { color: #00FF00; font-weight: bold; font-size: 14px; margin-top: 5px; }</style>""", unsafe_allow_html=True)
     
-    # DEFINE THE CARD FUNCTION HERE BEFORE CALLING IT
     def card(c, i, t, d, w, b, r): 
         c.markdown(f"""<div class="trophy-card"><div class="t-icon">{i}</div><div class="t-head">{t}</div><div class="t-sub">{d}<br><i>{r}</i></div><div class="t-name">{w}</div><div class="t-bonus">{b}</div></div>""", unsafe_allow_html=True)
 
