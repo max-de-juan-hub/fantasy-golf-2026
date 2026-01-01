@@ -16,9 +16,7 @@ SPREADSHEET_NAME = "fantasy_golf_db"
 
 # --- HELPER FUNCTIONS ---
 def load_data(conn):
-    # FORCE CLEAR CACHE
     st.cache_data.clear()
-    
     try:
         players = conn.read(worksheet="players", spreadsheet=SPREADSHEET_NAME, ttl=0)
         rounds = conn.read(worksheet="rounds", spreadsheet=SPREADSHEET_NAME, ttl=0)
@@ -26,27 +24,20 @@ def load_data(conn):
         st.error(f"Connection Error: {e}")
         return pd.DataFrame(), pd.DataFrame()
     
-    # 1. Fill Missing Columns (Safety)
-    # We add match_id to defaults to handle legacy data
     defaults = {
         "holes_played": "18", "gross_score": 0, "match_type": "Standard", 
         "notes": "", "stableford_score": 0, "rp_earned": 0, "course": "Unknown",
         "date": str(datetime.date.today()), "match_id": "legacy"
     }
     for col, val in defaults.items():
-        if col not in rounds.columns: 
-            rounds[col] = val
+        if col not in rounds.columns: rounds[col] = val
 
-    # 2. Robust Type Conversion
     rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str)
-    
-    # Ensure string type for ID
     rounds["match_id"] = rounds["match_id"].astype(str).replace("nan", "legacy")
     
     for col in ["gross_score", "stableford_score", "rp_earned"]:
         rounds[col] = pd.to_numeric(rounds[col], errors='coerce').fillna(0).astype(int)
 
-    # 3. UNBREAKABLE DATE PARSING
     rounds["date_parsed"] = pd.to_datetime(rounds["date"], dayfirst=True, errors='coerce')
     rounds["date"] = rounds["date_parsed"].fillna(pd.Timestamp.now())
     rounds = rounds.drop(columns=["date_parsed"])
@@ -114,55 +105,93 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 df_players, df_rounds = load_data(conn)
 player_list = df_players["name"].tolist() if not df_players.empty else []
 
-# --- 1. STATS ENGINE ---
+# --- 1. STATS ENGINE (VECTORIZED) ---
+# Initialize Stats DataFrame
 stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
 for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: stats[c] = 0
 stats["2v2 Record"] = "0-0-0"
-current_rp_map = {}
+
+# GLOBAL MAP for Slayer Logic
+current_rp_map = {} # Built dynamically if needed, but for leaderboard we aggregate
 
 if not df_rounds.empty:
-    for i, r in df_rounds.iterrows():
-        p, rp = r["player_name"], r["rp_earned"]
-        if p in stats.index:
-            stats.at[p, "Tournament 1 Ranking Points"] += rp
-            current_rp_map[p] = stats.at[p, "Tournament 1 Ranking Points"]
-            if pd.notnull(r["date"]):
-                s = get_season(r["date"])
-                if s in stats.columns: stats.at[p, s] += rp
-            if r["match_type"] in ["Standard", "Duel"]:
-                stats.at[p, "Rounds"] += 1
-
-    std_18 = df_rounds[(df_rounds["holes_played"] == "18") & (df_rounds["match_type"] == "Standard")]
-    if not std_18.empty:
-        avg = std_18.groupby("player_name")["stableford_score"].mean()
-        stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
+    # 1. TOTAL RP & SEASON RP
+    # Group by player and sum RP
+    total_rp = df_rounds.groupby("player_name")["rp_earned"].sum()
+    stats["Tournament 1 Ranking Points"] = stats["Tournament 1 Ranking Points"].add(total_rp, fill_value=0)
     
-    valid_gross = df_rounds[(df_rounds["holes_played"] == "18") & (df_rounds["match_type"].isin(["Standard", "Duel"])) & (df_rounds["gross_score"] > 0)]
-    if not valid_gross.empty:
-        best = valid_gross.groupby("player_name")["gross_score"].min()
-        for p, val in best.items(): 
+    # Update Map
+    for p, val in total_rp.items(): current_rp_map[p] = val
+
+    # Seasons
+    df_rounds["season"] = df_rounds["date"].apply(get_season)
+    season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
+    for s in ["Season 1", "Season 2"]:
+        if s in season_rp.columns:
+            stats[s] = stats[s].add(season_rp[s], fill_value=0)
+
+    # 2. ROUNDS PLAYED (Standard + Duel)
+    # Filter for countable rounds
+    countable = df_rounds[df_rounds["match_type"].isin(["Standard", "Duel"])]
+    rounds_count = countable.groupby("player_name").size()
+    stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
+
+    # 3. AVG SCORE & BEST GROSS (Standard/Duel 18H)
+    valid_18 = df_rounds[
+        (df_rounds["holes_played"] == "18") & 
+        (df_rounds["match_type"].isin(["Standard", "Duel"]))
+    ]
+    
+    # Avg Score (Standard Only usually, but let's stick to Standard for consistency of HCP play)
+    # User requested Standard Only for Avg
+    std_18 = valid_18[valid_18["match_type"] == "Standard"]
+    if not std_18.empty:
+        avg_scores = std_18.groupby("player_name")["stableford_score"].mean()
+        stats["Avg Score"] = stats["Avg Score"].add(avg_scores, fill_value=0)
+
+    # Best Gross (Standard OR Duel)
+    gross_valid = valid_18[valid_18["gross_score"] > 0]
+    if not gross_valid.empty:
+        best_gross = gross_valid.groupby("player_name")["gross_score"].min()
+        for p, val in best_gross.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
+    # 4. RECORDS (1v1 & 2v2)
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
-        stats["1v1 Wins"] = stats["1v1 Wins"].add(duels[duels["rp_earned"] > 0].groupby("player_name").size(), fill_value=0)
-        stats["1v1 Losses"] = stats["1v1 Losses"].add(duels[duels["rp_earned"] < 0].groupby("player_name").size(), fill_value=0)
-    
+        w = duels[duels["rp_earned"] > 0].groupby("player_name").size()
+        l = duels[duels["rp_earned"] < 0].groupby("player_name").size()
+        stats["1v1 Wins"] = stats["1v1 Wins"].add(w, fill_value=0)
+        stats["1v1 Losses"] = stats["1v1 Losses"].add(l, fill_value=0)
+
     allies = df_rounds[df_rounds["match_type"] == "Alliance"]
     if not allies.empty:
         w = allies[allies["rp_earned"] > 0].groupby("player_name").size()
         t = allies[allies["rp_earned"] == 0].groupby("player_name").size()
         l = allies[allies["rp_earned"] < 0].groupby("player_name").size()
-        for p in stats.index: stats.at[p, "2v2 Record"] = f"{int(w.get(p,0))}-{int(t.get(p,0))}-{int(l.get(p,0))}"
+        for p in stats.index:
+            stats.at[p, "2v2 Record"] = f"{int(w.get(p,0))}-{int(t.get(p,0))}-{int(l.get(p,0))}"
+
+    # 5. DAILY WINS (Group by Match ID)
+    # Logic: For every unique match_id in Standard/Duel, find highest stableford score.
+    # Note: Duels are head-to-head, so "Winner" is just RP > 0.
     
-    # Daily Wins (Standard)
-    # Group by Date + Course (and Match ID if possible, but date/course is standard rule)
-    for (d, c), g in std_18.groupby(["date", "course"]):
-        if not g.empty:
-            m = g["stableford_score"].max()
-            for w in g[g["stableford_score"] == m]["player_name"].unique():
-                if w in stats.index: stats.at[w, "Daily Wins"] += 1
-    # Duel Wins
+    # A. Standard Matches (Group by Match ID)
+    # We only count Standard match wins for "Daily Wins" usually, but Duel winners get a win credit too.
+    
+    # Standard Wins
+    std_matches = df_rounds[df_rounds["match_type"] == "Standard"]
+    if not std_matches.empty:
+        # Group by match_id (or Date/Course for legacy)
+        for mid, group in std_matches.groupby("match_id"):
+            if not group.empty:
+                max_s = group["stableford_score"].max()
+                # All players with max score get a win
+                winners = group[group["stableford_score"] == max_s]["player_name"].unique()
+                for w in winners:
+                    if w in stats.index: stats.at[w, "Daily Wins"] += 1
+    
+    # Duel Wins (RP > 0)
     for w in duels[duels["rp_earned"] > 0]["player_name"]:
         if w in stats.index: stats.at[w, "Daily Wins"] += 1
 
@@ -171,34 +200,54 @@ holder_rock, holder_sniper, holder_conq = None, None, None
 
 def resolve_tie(cand, metric):
     if len(cand) == 1: return cand.index[0]
-    best_val = cand[metric].max() if metric != "Best Gross" else cand[metric].min()
+    # For Gross, LOWER is better. For others, HIGHER is better.
+    ascending = True if metric == "Best Gross" else False
+    
+    best_val = cand[metric].min() if ascending else cand[metric].max()
     tied = cand[cand[metric] == best_val]
+    
     if len(tied) == 1: return tied.index[0]
+    
+    # Tie-breaker: Daily Wins (Higher is better)
     best_wins = tied["Daily Wins"].max()
     tied_wins = tied[tied["Daily Wins"] == best_wins]
+    
     return tied_wins.index[0] if len(tied_wins) == 1 else "Tied"
 
+# Rock (Avg Score, Min 3 Rounds)
 q_rock = stats[stats["Rounds"] >= 3]
 if not q_rock.empty:
     holder_rock = resolve_tie(q_rock, "Avg Score")
     if holder_rock != "Tied" and holder_rock: stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
 
+# Sniper (Lowest Gross, Month)
 curr = datetime.date.today()
-m_rnds = df_rounds[(df_rounds["date"].dt.month == curr.month) & (df_rounds["date"].dt.year == curr.year) & (df_rounds["gross_score"] > 0) & (df_rounds["holes_played"] == "18") & (df_rounds["match_type"].isin(["Standard", "Duel"]))]
+m_rnds = df_rounds[
+    (df_rounds["date"].dt.month == curr.month) & 
+    (df_rounds["date"].dt.year == curr.year) & 
+    (df_rounds["gross_score"] > 0) & 
+    (df_rounds["holes_played"] == "18") &
+    (df_rounds["match_type"].isin(["Standard", "Duel"]))
+]
 if not m_rnds.empty:
     min_g = m_rnds["gross_score"].min()
     s_list = m_rnds[m_rnds["gross_score"] == min_g]["player_name"].unique()
+    
     if len(s_list) == 1: holder_sniper = s_list[0]
     else: 
         s_stats = stats[stats.index.isin(s_list)]
         holder_sniper = resolve_tie(s_stats, "Daily Wins")
-    if holder_sniper != "Tied" and holder_sniper in stats.index: stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
+        
+    if holder_sniper != "Tied" and holder_sniper in stats.index: 
+        stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
 
+# Conqueror (Most Wins, Min 3 Rounds)
 q_conq = stats[stats["Rounds"] >= 3]
 if not q_conq.empty:
     holder_conq = resolve_tie(q_conq, "Daily Wins")
     if holder_conq != "Tied" and holder_conq: stats.at[holder_conq, "Tournament 1 Ranking Points"] += 10
 
+# Final Formatting
 stats["Avg Score"] = stats["Avg Score"].round(1)
 stats = stats.sort_values("Tournament 1 Ranking Points", ascending=False).reset_index()
 def decorate(row):
@@ -270,9 +319,7 @@ with tab_submit:
             if st.form_submit_button("Submit Scorecards"):
                 if not selected_players: st.error("Select players first.")
                 else:
-                    # GENERATE BATCH ID
                     batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
-                    
                     group_scores = [{'name': d['name'], 'score': d['score']} for d in input_data]
                     new_rows = []
                     for d in input_data:
@@ -360,17 +407,11 @@ with tab_history:
     if not df_rounds.empty:
         df_show = df_rounds.copy()
         df_show['d_str'] = df_show['date'].dt.strftime('%Y-%m-%d')
-        # Sort desc
         df_show = df_show.sort_values("date", ascending=False)
         
-        # KEY CHANGE: GROUP BY MATCH ID (Batch ID)
-        # If match_id is "legacy", fall back to Date+Course grouping
-        
-        # We process in two chunks: Legacy vs Modern
         modern = df_show[df_show["match_id"] != "legacy"]
         legacy = df_show[df_show["match_id"] == "legacy"]
         
-        # 1. Modern Groups (By ID)
         groups = []
         if not modern.empty:
             for m_id, g in modern.groupby("match_id"):
@@ -382,45 +423,32 @@ with tab_history:
                     "sort_val": first['date']
                 })
         
-        # 2. Legacy Groups (By Date/Course)
         if not legacy.empty:
             for (d_str, crs, mtype), g in legacy.groupby(['d_str', 'course', 'match_type']):
                 groups.append({
                     "key": f"{d_str}_{crs}", 
-                    "label": f"📅 {d_str} | {crs} | {mtype} (Legacy Group)",
+                    "label": f"📅 {d_str} | {crs} | {mtype} (Legacy)",
                     "data": g,
                     "sort_val": g.iloc[0]['date']
                 })
         
-        # Sort all groups by date desc
         groups.sort(key=lambda x: x['sort_val'], reverse=True)
         
         for grp in groups:
             with st.expander(grp["label"]):
                 g = grp["data"]
-                edited = st.data_editor(
-                    g[["player_name", "stableford_score", "gross_score", "rp_earned", "notes"]],
-                    key=f"editor_{grp['key']}",
-                    use_container_width=True,
-                    num_rows="dynamic"
-                )
-                
+                edited = st.data_editor(g[["player_name", "stableford_score", "gross_score", "rp_earned", "notes"]], key=f"e_{grp['key']}", use_container_width=True, num_rows="dynamic")
                 col_s, col_d = st.columns([1, 4])
-                if col_s.button("Save Changes", key=f"save_{grp['key']}"):
-                    df_rounds = df_rounds.drop(g.index) # Remove old
-                    # Reconstruct
+                if col_s.button("Save", key=f"s_{grp['key']}"):
+                    df_rounds = df_rounds.drop(g.index)
                     save_df = edited.copy()
-                    # Restore meta columns from original group (taking first row as template)
-                    template = g.iloc[0]
-                    for col in ["date", "course", "match_type", "holes_played", "match_id"]:
-                        save_df[col] = template[col]
-                    
+                    t = g.iloc[0]
+                    for c in ["date", "course", "match_type", "holes_played", "match_id"]: save_df[c] = t[c]
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, save_df], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
                     st.success("Updated!")
                     st.rerun()
-                    
-                if col_d.button("Delete Match", key=f"del_{grp['key']}"):
+                if col_d.button("Delete", key=f"d_{grp['key']}"):
                     df_rounds = df_rounds.drop(g.index)
                     conn.update(worksheet="rounds", data=df_rounds, spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
@@ -429,9 +457,10 @@ with tab_history:
 
 with tab_admin:
     st.header("⚙️ Admin")
-    st.write("### 🔍 Debug Data")
-    with st.expander("Raw Data"):
-        st.dataframe(df_rounds)
+    st.write("### 🔍 Debug Data (Raw from Google Sheets)")
+    with st.expander("Show Raw Dataframes"):
+        st.write("#### Rounds Data", df_rounds)
+        st.write("#### Players Data", df_players)
     st.divider()
     with st.form("add_p"):
         n = st.text_input("Name")
