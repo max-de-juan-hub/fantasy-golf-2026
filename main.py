@@ -43,7 +43,7 @@ def load_data(conn):
     for col, val in defaults.items():
         if col not in rounds.columns: rounds[col] = val
 
-    # Force Types
+    # FORCE TYPE CONVERSION
     rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str).str.replace(".0", "", regex=False)
     rounds["match_id"] = rounds["match_id"].astype(str).replace("nan", "legacy")
     
@@ -108,6 +108,9 @@ def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, c
 def get_season(date_obj):
     if pd.isnull(date_obj): return "Unknown"
     y, d = date_obj.year, date_obj.date()
+    # Season 1: Jan 1 - Jun 20 (Per Rulebook - T1 consists of S1+S2 actually?)
+    # Wait, Rulebook says: T1 (Jan-Jun) split into S1(Jan-Mar) and S2(Apr-Jun)
+    # Correcting ranges:
     if datetime.date(y, 1, 1) <= d <= datetime.date(y, 3, 31): return "Season 1"
     if datetime.date(y, 4, 1) <= d <= datetime.date(y, 6, 20): return "Season 2"
     return "Off-Season"
@@ -119,35 +122,37 @@ player_list = df_players["name"].tolist() if not df_players.empty else []
 
 # --- 1. STATS ENGINE ---
 stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
-for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: 
-    stats[c] = 0
+cols = [
+    "Tournament 1 Ranking Points", "Season 1", "Season 2", 
+    "Bonus RP S1", "Bonus RP S2",
+    "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"
+]
+for c in cols: stats[c] = 0
 stats["2v2 Record"] = "0-0-0"
 
 current_rp_map = {}
 
 if not df_rounds.empty:
-    # 1. Total RP & Map
-    total_rp = df_rounds.groupby("player_name")["rp_earned"].sum()
-    stats["Tournament 1 Ranking Points"] = stats["Tournament 1 Ranking Points"].add(total_rp, fill_value=0)
-    for p, val in total_rp.items(): current_rp_map[p] = val
-
-    # 2. Season RP
+    # 1. Base RP (Before Bonuses)
+    # We calculate Base RP from rounds first
     df_rounds["season"] = df_rounds["date"].apply(get_season)
     season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
+    
     for s in ["Season 1", "Season 2"]:
-        if s in season_rp.columns: stats[s] = stats[s].add(season_rp[s], fill_value=0)
+        if s in season_rp.columns: 
+            stats[s] = stats[s].add(season_rp[s], fill_value=0)
 
-    # 3. ROUNDS PLAYED (Count everything)
+    # 2. Rounds Played
     rounds_count = df_rounds.groupby("player_name").size()
     stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
 
-    # 4. AVG SCORE (Standard Only)
+    # 3. Avg Score (Standard)
     std_matches = df_rounds[df_rounds["match_type"] == "Standard"]
     if not std_matches.empty:
         avg = std_matches.groupby("player_name")["stableford_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
 
-    # 5. BEST GROSS (Current Month Only, >0, 18H, Std/Duel)
+    # 4. Best Gross (Month)
     curr = datetime.date.today()
     month_rnds = df_rounds[
         (df_rounds["date"].dt.month == curr.month) & 
@@ -161,7 +166,7 @@ if not df_rounds.empty:
         for p, val in best_month.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
-    # 6. DAILY WINS (All types)
+    # 5. Daily Wins
     if not std_matches.empty:
         for mid, group in std_matches.groupby("match_id"):
             max_s = group["stableford_score"].max()
@@ -175,7 +180,7 @@ if not df_rounds.empty:
         for w in winners:
             if w in stats.index: stats.at[w, "Daily Wins"] += 1
 
-    # 7. RECORDS
+    # 6. Records
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
         w = duels[duels["rp_earned"] > 0].groupby("player_name").size()
@@ -191,60 +196,67 @@ if not df_rounds.empty:
         for p in stats.index:
             stats.at[p, "2v2 Record"] = f"{int(w.get(p,0))}-{int(t.get(p,0))}-{int(l.get(p,0))}"
 
-# --- 2. TROPHY LOGIC ---
+# --- 2. TROPHY LOGIC (BONUS RP) ---
 holder_rock, holder_sniper, holder_conq, holder_rocket = None, None, None, None
+
+# Determine current bonus column based on date
+current_season_col = "Bonus RP S1" if get_season(datetime.datetime.now()) == "Season 1" else "Bonus RP S2"
+# Fallback if off-season (default to S2 or S1? Let's default S1 for Jan)
+if get_season(datetime.datetime.now()) == "Off-Season": current_season_col = "Bonus RP S1" 
 
 def resolve_tie(cand, metric):
     if len(cand) == 1: return cand.index[0]
     is_gross = (metric == "Best Gross")
-    
     if is_gross:
         cand = cand[cand[metric] > 0]
         if cand.empty: return None
         best_val = cand[metric].min()
     else:
         best_val = cand[metric].max()
-        
     tied = cand[cand[metric] == best_val]
     if len(tied) == 1: return tied.index[0]
-    
     best_wins = tied["Daily Wins"].max()
     tied_wins = tied[tied["Daily Wins"] == best_wins]
     return tied_wins.index[0] if len(tied_wins) == 1 else "Tied"
+
+def award_bonus(holder, points):
+    if holder and holder != "Tied" and holder in stats.index:
+        stats.at[holder, current_season_col] += points
 
 # Rock
 q_rock = stats[stats["Rounds"] >= 3]
 if not q_rock.empty:
     holder_rock = resolve_tie(q_rock, "Avg Score")
-    if holder_rock and holder_rock != "Tied": stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
+    award_bonus(holder_rock, 10)
 
-# Rocket (HCP Reduction)
-stats["HCP Reduction"] = stats.apply(
-    lambda row: df_players.loc[df_players["name"]==row.name, "start_handicap"].values[0] - row["handicap"] 
-    if row.name in df_players["name"].values else 0, axis=1
-)
+# Rocket
+stats["HCP Reduction"] = stats.apply(lambda row: df_players.loc[df_players["name"]==row.name, "start_handicap"].values[0] - row["handicap"] if row.name in df_players["name"].values else 0, axis=1)
 q_rocket = stats[stats["Rounds"] >= 3]
 if not q_rocket.empty:
     q_rocket = q_rocket[q_rocket["HCP Reduction"] > 0]
     if not q_rocket.empty:
         holder_rocket = resolve_tie(q_rocket, "HCP Reduction")
-        if holder_rocket and holder_rocket != "Tied":
-            stats.at[holder_rocket, "Tournament 1 Ranking Points"] += 10
+        award_bonus(holder_rocket, 10)
 
 # Sniper
 q_sniper = stats[stats["Best Gross"] > 0]
 if not q_sniper.empty:
     holder_sniper = resolve_tie(q_sniper, "Best Gross")
-    if holder_sniper and holder_sniper != "Tied": 
-        stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
+    award_bonus(holder_sniper, 5)
 
 # Conqueror
 q_conq = stats[stats["Rounds"] >= 3]
 if not q_conq.empty:
     holder_conq = resolve_tie(q_conq, "Daily Wins")
-    if holder_conq and holder_conq != "Tied": stats.at[holder_conq, "Tournament 1 Ranking Points"] += 10
+    award_bonus(holder_conq, 10)
 
-# Final Formatting
+# 3. FINAL SUM (Total = S1 + S1Bonus + S2 + S2Bonus)
+stats["Tournament 1 Ranking Points"] = stats["Season 1"] + stats["Bonus RP S1"] + stats["Season 2"] + stats["Bonus RP S2"]
+
+# Populate Map for Slayer
+for p, val in stats["Tournament 1 Ranking Points"].items(): current_rp_map[p] = val
+
+# Formatting
 stats = stats.sort_values("Tournament 1 Ranking Points", ascending=False).reset_index()
 def decorate(row):
     n, i = row["player_name"], ""
@@ -276,7 +288,7 @@ with tab_leaderboard:
     cols_order = [
         "Player", "Tournament 1 Ranking Points", "Handicap", "Daily Wins", 
         "Best Round", "Average Stableford", "Rounds Played", "1v1 Record", 
-        "2v2 Record", "Season 1 RP", "Season 2 RP"
+        "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2"
     ]
     final_cols = [c for c in cols_order if c in v.columns]
     v = v[final_cols]
@@ -291,7 +303,7 @@ with tab_leaderboard:
         return [''] * len(row)
 
     st.dataframe(v.style.apply(color_row, axis=1), use_container_width=True, hide_index=True)
-    st.caption("🔶 **Orange:** Leader | 🟡 **Yellow:** Top 4 | 🏆 **Bonuses:** 🪨 Rock(+10) 🎯 Sniper(+5) 👑 Conqueror(+10)")
+    st.caption("🔶 **Orange:** Leader | 🟡 **Yellow:** Top 4 | 🏆 **Bonuses:** 🪨 Rock(+10) 🎯 Sniper(+5) 👑 Conqueror(+10) 🚀 Rocket(+10)")
 
 with tab_trophy:
     st.header("🏆 The Hall of Fame")
@@ -464,11 +476,6 @@ with tab_history:
 
 with tab_admin:
     st.header("⚙️ Admin")
-    st.write("### 🔍 Debug Data")
-    with st.expander("Show Raw Data"):
-        st.write(df_rounds)
-        st.write(df_players)
-        
     with st.expander("⚠️ Season Management (Danger Zone)"):
         st.warning("This will reset the 'Rocket Award' baseline. Use this ONLY at the start of a new season (e.g., July 1st).")
         confirm_text = st.text_input("Type 'NEW SEASON' to confirm reset:")
@@ -481,7 +488,11 @@ with tab_admin:
                 st.rerun()
             else:
                 st.error("Please type 'NEW SEASON' exactly.")
-
+    
+    st.write("### 🔍 Debug Data")
+    with st.expander("Show Raw Data"):
+        st.write(df_rounds)
+        st.write(df_players)
     st.divider()
     with st.form("add_p"):
         n = st.text_input("Name")
