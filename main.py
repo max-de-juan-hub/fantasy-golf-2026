@@ -10,22 +10,19 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- SIDEBAR: FORCE RELOAD ---
-if st.sidebar.button("🔄 Reload Data (Clear Cache)"):
-    st.cache_data.clear()
-    st.rerun()
-
 # --- CONSTANTS ---
 SPREADSHEET_NAME = "fantasy_golf_db"
 
 # --- HELPER FUNCTIONS ---
 def load_data(conn):
-    # READ DATA NO CACHE (ttl=0)
+    # FORCE CLEAR CACHE on every load to ensure fresh data
+    st.cache_data.clear()
+    
     try:
         players = conn.read(worksheet="players", spreadsheet=SPREADSHEET_NAME, ttl=0)
         rounds = conn.read(worksheet="rounds", spreadsheet=SPREADSHEET_NAME, ttl=0)
     except Exception as e:
-        st.error(f"Connection Error: {e}")
+        st.error(f"CRITICAL ERROR: Could not connect to Google Sheets. {e}")
         return pd.DataFrame(), pd.DataFrame()
     
     # 1. Ensure Columns
@@ -38,18 +35,14 @@ def load_data(conn):
         if col not in rounds.columns: 
             rounds[col] = val
 
-    # 2. CLEAN UP NUMBERS (Force 0 instead of crash)
+    # 2. CLEAN UP NUMBERS
     rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str)
-    
     for col in ["gross_score", "stableford_score", "rp_earned"]:
-        # Coerce errors to NaN, then fill with 0
         rounds[col] = pd.to_numeric(rounds[col], errors='coerce').fillna(0).astype(int)
 
-    # 3. CLEAN UP DATES (The likely culprit)
-    # dayfirst=True handles 31/01/2026 correctly. errors='coerce' turns bad dates into NaT
+    # 3. CLEAN UP DATES (Handle mixed formats)
+    # We try mixed format first, then coerce errors
     rounds["date"] = pd.to_datetime(rounds["date"], dayfirst=True, errors='coerce')
-    
-    # Remove rows where date is completely broken (NaT), but keep everything else
     rounds = rounds.dropna(subset=["date"])
     
     return players, rounds
@@ -70,14 +63,12 @@ def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, c
     breakdown = []
     is_9 = (str(holes) == "9")
     part_pts = 1 if is_9 else 2
-    
     target = 18 if is_9 else 36
     diff = score - target
     perf_pts = diff * 2 if diff >= 0 else int(diff / 2)
     
     breakdown.append(f"Part(+{part_pts})")
     breakdown.append(f"Perf({'+' if perf_pts>0 else ''}{perf_pts})")
-    
     total = part_pts + perf_pts
     
     if is_clean and not is_9: total += 2; breakdown.append("Clean(+2)")
@@ -117,6 +108,12 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 df_players, df_rounds = load_data(conn)
 player_list = df_players["name"].tolist() if not df_players.empty else []
 
+# DEBUG INDICATOR
+if not df_rounds.empty:
+    st.toast(f"✅ Data Loaded: Found {len(df_rounds)} historical rounds.", icon="📊")
+else:
+    st.error("⚠️ Warning: No rounds found in database (or connection failed).")
+
 # --- 1. STATS ENGINE ---
 stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
 for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: stats[c] = 0
@@ -133,20 +130,17 @@ if not df_rounds.empty:
             if s in stats.columns: stats.at[p, s] += rp
             if r["match_type"] in ["Standard", "Duel"]: stats.at[p, "Rounds"] += 1
 
-    # Avg (Standard Only)
     std_18 = df_rounds[(df_rounds["holes_played"] == "18") & (df_rounds["match_type"] == "Standard")]
     if not std_18.empty:
         avg = std_18.groupby("player_name")["stableford_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
     
-    # Best (Standard + Duel)
     valid_gross = df_rounds[(df_rounds["holes_played"] == "18") & (df_rounds["match_type"].isin(["Standard", "Duel"])) & (df_rounds["gross_score"] > 0)]
     if not valid_gross.empty:
         best = valid_gross.groupby("player_name")["gross_score"].min()
         for p, val in best.items(): 
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
-    # Records
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
         stats["1v1 Wins"] = stats["1v1 Wins"].add(duels[duels["rp_earned"] > 0].groupby("player_name").size(), fill_value=0)
@@ -159,7 +153,6 @@ if not df_rounds.empty:
         l = allies[allies["rp_earned"] < 0].groupby("player_name").size()
         for p in stats.index: stats.at[p, "2v2 Record"] = f"{int(w.get(p,0))}-{int(t.get(p,0))}-{int(l.get(p,0))}"
     
-    # Daily Wins (Standard + Duel)
     for (d, c), g in std_18.groupby(["date", "course"]):
         if not g.empty:
             m = g["stableford_score"].max()
@@ -380,7 +373,6 @@ with tab_admin:
     with st.expander("Show Raw Dataframes"):
         st.write("#### Rounds Data", df_rounds)
         st.write("#### Players Data", df_players)
-    
     st.divider()
     with st.form("add_p"):
         n = st.text_input("Name")
