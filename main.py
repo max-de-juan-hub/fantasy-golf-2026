@@ -2,6 +2,7 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import datetime
+import time
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -19,7 +20,6 @@ def load_data(conn):
     st.cache_data.clear()
     
     try:
-        # Read raw data with no caching
         players = conn.read(worksheet="players", spreadsheet=SPREADSHEET_NAME, ttl=0)
         rounds = conn.read(worksheet="rounds", spreadsheet=SPREADSHEET_NAME, ttl=0)
     except Exception as e:
@@ -27,10 +27,11 @@ def load_data(conn):
         return pd.DataFrame(), pd.DataFrame()
     
     # 1. Fill Missing Columns (Safety)
+    # We add match_id to defaults to handle legacy data
     defaults = {
         "holes_played": "18", "gross_score": 0, "match_type": "Standard", 
         "notes": "", "stableford_score": 0, "rp_earned": 0, "course": "Unknown",
-        "date": str(datetime.date.today())
+        "date": str(datetime.date.today()), "match_id": "legacy"
     }
     for col, val in defaults.items():
         if col not in rounds.columns: 
@@ -39,17 +40,15 @@ def load_data(conn):
     # 2. Robust Type Conversion
     rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str)
     
+    # Ensure string type for ID
+    rounds["match_id"] = rounds["match_id"].astype(str).replace("nan", "legacy")
+    
     for col in ["gross_score", "stableford_score", "rp_earned"]:
         rounds[col] = pd.to_numeric(rounds[col], errors='coerce').fillna(0).astype(int)
 
     # 3. UNBREAKABLE DATE PARSING
-    # If date parsing fails, we DO NOT delete the row. We set it to Today.
     rounds["date_parsed"] = pd.to_datetime(rounds["date"], dayfirst=True, errors='coerce')
-    
-    # If "date_parsed" is NaT (Not a Time), fill it with Today's date
     rounds["date"] = rounds["date_parsed"].fillna(pd.Timestamp.now())
-    
-    # Drop the temporary column
     rounds = rounds.drop(columns=["date_parsed"])
     
     return players, rounds
@@ -125,16 +124,11 @@ if not df_rounds.empty:
     for i, r in df_rounds.iterrows():
         p, rp = r["player_name"], r["rp_earned"]
         if p in stats.index:
-            # RP Totals
             stats.at[p, "Tournament 1 Ranking Points"] += rp
             current_rp_map[p] = stats.at[p, "Tournament 1 Ranking Points"]
-            
-            # Season (Safe check)
             if pd.notnull(r["date"]):
                 s = get_season(r["date"])
                 if s in stats.columns: stats.at[p, s] += rp
-            
-            # Rounds Count
             if r["match_type"] in ["Standard", "Duel"]:
                 stats.at[p, "Rounds"] += 1
 
@@ -161,11 +155,14 @@ if not df_rounds.empty:
         l = allies[allies["rp_earned"] < 0].groupby("player_name").size()
         for p in stats.index: stats.at[p, "2v2 Record"] = f"{int(w.get(p,0))}-{int(t.get(p,0))}-{int(l.get(p,0))}"
     
+    # Daily Wins (Standard)
+    # Group by Date + Course (and Match ID if possible, but date/course is standard rule)
     for (d, c), g in std_18.groupby(["date", "course"]):
         if not g.empty:
             m = g["stableford_score"].max()
             for w in g[g["stableford_score"] == m]["player_name"].unique():
                 if w in stats.index: stats.at[w, "Daily Wins"] += 1
+    # Duel Wins
     for w in duels[duels["rp_earned"] > 0]["player_name"]:
         if w in stats.index: stats.at[w, "Daily Wins"] += 1
 
@@ -273,6 +270,9 @@ with tab_submit:
             if st.form_submit_button("Submit Scorecards"):
                 if not selected_players: st.error("Select players first.")
                 else:
+                    # GENERATE BATCH ID
+                    batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
+                    
                     group_scores = [{'name': d['name'], 'score': d['score']} for d in input_data]
                     new_rows = []
                     for d in input_data:
@@ -280,7 +280,11 @@ with tab_submit:
                         curr_hcp = df_players.loc[df_players["name"] == d['name'], "handicap"].values[0]
                         new_hcp = calculate_new_handicap(curr_hcp, d['score'])
                         df_players.loc[df_players["name"] == d['name'], "handicap"] = new_hcp
-                        new_rows.append({"date": str(dt), "course": crs, "player_name": d['name'], "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], "rp_earned": rp, "notes": note, "match_type": "Standard"})
+                        new_rows.append({
+                            "date": str(dt), "course": crs, "player_name": d['name'], 
+                            "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], 
+                            "rp_earned": rp, "notes": note, "match_type": "Standard", "match_id": batch_id
+                        })
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
                     conn.update(worksheet="players", data=df_players, spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
@@ -305,12 +309,16 @@ with tab_submit:
             if st.form_submit_button("Record Duel"):
                 if p1 == p2: st.error("Same player selected.")
                 else:
+                    batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
                     win_p, lose_p = winner, (p2 if winner == p1 else p1)
                     steal = 10 if "Upset" in stake else 5
                     base = 1 if hl=="9" else 2
                     w_note = f"Part(+{base}), Duel Win(+{steal})"
                     l_note = f"Part(+{base}), Duel Loss(-{steal})"
-                    rows = [{"date":str(dt), "course":crs, "player_name":win_p, "holes_played":hl, "gross_score":(g1 if win_p==p1 else g2), "rp_earned": base+steal, "notes":w_note, "match_type":"Duel"}, {"date":str(dt), "course":crs, "player_name":lose_p, "holes_played":hl, "gross_score":(g2 if win_p==p1 else g1), "rp_earned": base-steal, "notes":l_note, "match_type":"Duel"}]
+                    rows = [
+                        {"date":str(dt), "course":crs, "player_name":win_p, "holes_played":hl, "gross_score":(g1 if win_p==p1 else g2), "rp_earned": base+steal, "notes":w_note, "match_type":"Duel", "match_id": batch_id},
+                        {"date":str(dt), "course":crs, "player_name":lose_p, "holes_played":hl, "gross_score":(g2 if win_p==p1 else g1), "rp_earned": base-steal, "notes":l_note, "match_type":"Duel", "match_id": batch_id}
+                    ]
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
                     st.success("Duel Saved!")
@@ -330,17 +338,18 @@ with tab_submit:
             crs = st.text_input("Course")
             if st.form_submit_button("Submit 2v2"):
                 rows = []
+                batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
                 def is_debut(p): return len(df_rounds[(df_rounds["player_name"]==p) & (df_rounds["match_type"]=="Alliance")]) == 0
                 for p in [w1, w2]: 
                     bonus = 5 if is_debut(p) else 0
                     note = f"Win ({wh}-{lh})"
                     if bonus: note += ", Duo Debut(+5)"
-                    rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": 5+bonus, "notes":note, "match_type":"Alliance"})
+                    rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": 5+bonus, "notes":note, "match_type":"Alliance", "match_id": batch_id})
                 for p in [l1, l2]:
                     bonus = 5 if is_debut(p) else 0
                     note = f"Loss ({wh}-{lh})"
                     if bonus: note += ", Duo Debut(+5)"
-                    rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": -5+bonus, "notes":note, "match_type":"Alliance"})
+                    rows.append({"date":str(dt), "course":crs, "player_name":p, "holes_played":"18", "rp_earned": -5+bonus, "notes":note, "match_type":"Alliance", "match_id": batch_id})
                 conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
                 st.cache_data.clear()
                 st.success("Alliance Saved!")
@@ -351,24 +360,67 @@ with tab_history:
     if not df_rounds.empty:
         df_show = df_rounds.copy()
         df_show['d_str'] = df_show['date'].dt.strftime('%Y-%m-%d')
+        # Sort desc
         df_show = df_show.sort_values("date", ascending=False)
-        groups = df_show.groupby(['d_str', 'course', 'match_type'], sort=False)
-        for (d, c, t), g in groups:
-            with st.expander(f"📅 {d} | {c} | {t} ({len(g)} Players)"):
-                edited = st.data_editor(g[["player_name", "stableford_score", "gross_score", "rp_earned", "notes"]], key=f"e_{d}_{c}_{t}", use_container_width=True, num_rows="dynamic")
+        
+        # KEY CHANGE: GROUP BY MATCH ID (Batch ID)
+        # If match_id is "legacy", fall back to Date+Course grouping
+        
+        # We process in two chunks: Legacy vs Modern
+        modern = df_show[df_show["match_id"] != "legacy"]
+        legacy = df_show[df_show["match_id"] == "legacy"]
+        
+        # 1. Modern Groups (By ID)
+        groups = []
+        if not modern.empty:
+            for m_id, g in modern.groupby("match_id"):
+                first = g.iloc[0]
+                groups.append({
+                    "key": m_id, 
+                    "label": f"📅 {first['d_str']} | {first['course']} | {first['match_type']} ({len(g)} Players)",
+                    "data": g,
+                    "sort_val": first['date']
+                })
+        
+        # 2. Legacy Groups (By Date/Course)
+        if not legacy.empty:
+            for (d_str, crs, mtype), g in legacy.groupby(['d_str', 'course', 'match_type']):
+                groups.append({
+                    "key": f"{d_str}_{crs}", 
+                    "label": f"📅 {d_str} | {crs} | {mtype} (Legacy Group)",
+                    "data": g,
+                    "sort_val": g.iloc[0]['date']
+                })
+        
+        # Sort all groups by date desc
+        groups.sort(key=lambda x: x['sort_val'], reverse=True)
+        
+        for grp in groups:
+            with st.expander(grp["label"]):
+                g = grp["data"]
+                edited = st.data_editor(
+                    g[["player_name", "stableford_score", "gross_score", "rp_earned", "notes"]],
+                    key=f"editor_{grp['key']}",
+                    use_container_width=True,
+                    num_rows="dynamic"
+                )
+                
                 col_s, col_d = st.columns([1, 4])
-                if col_s.button("Save", key=f"s_{d}_{c}_{t}"):
-                    df_rounds = df_rounds.drop(g.index)
+                if col_s.button("Save Changes", key=f"save_{grp['key']}"):
+                    df_rounds = df_rounds.drop(g.index) # Remove old
+                    # Reconstruct
                     save_df = edited.copy()
-                    save_df["date"] = pd.to_datetime(d)
-                    save_df["course"] = c
-                    save_df["match_type"] = t
-                    save_df["holes_played"] = g.iloc[0]["holes_played"]
+                    # Restore meta columns from original group (taking first row as template)
+                    template = g.iloc[0]
+                    for col in ["date", "course", "match_type", "holes_played", "match_id"]:
+                        save_df[col] = template[col]
+                    
                     conn.update(worksheet="rounds", data=pd.concat([df_rounds, save_df], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
                     st.success("Updated!")
                     st.rerun()
-                if col_d.button("Delete Match", key=f"d_{d}_{c}_{t}"):
+                    
+                if col_d.button("Delete Match", key=f"del_{grp['key']}"):
                     df_rounds = df_rounds.drop(g.index)
                     conn.update(worksheet="rounds", data=df_rounds, spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
@@ -377,10 +429,9 @@ with tab_history:
 
 with tab_admin:
     st.header("⚙️ Admin")
-    st.write("### 🔍 Debug Data (Raw from Google Sheets)")
-    with st.expander("Show Raw Dataframes"):
-        st.write("#### Rounds Data", df_rounds)
-        st.write("#### Players Data", df_players)
+    st.write("### 🔍 Debug Data")
+    with st.expander("Raw Data"):
+        st.dataframe(df_rounds)
     st.divider()
     with st.form("add_p"):
         n = st.text_input("Name")
