@@ -3,6 +3,7 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import datetime
 import time
+import math
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -30,7 +31,6 @@ def load_data(conn):
         st.warning(f"Connection Note: {e}")
         return pd.DataFrame(), pd.DataFrame()
     
-    # 1. Player Data Safety
     if players.empty:
         players = pd.DataFrame(columns=["name", "handicap", "start_handicap"])
     
@@ -39,7 +39,6 @@ def load_data(conn):
             if req == "name": players[req] = pd.Series(dtype='str')
             else: players[req] = 0.0
 
-    # 2. Round Data Safety
     defaults = {
         "holes_played": "18", "gross_score": 0, "match_type": "Standard", 
         "notes": "", "stableford_score": 0, "rp_earned": 0, "course": "Unknown",
@@ -52,7 +51,6 @@ def load_data(conn):
     for col, val in defaults.items():
         if col not in rounds.columns: rounds[col] = val
 
-    # Force Types
     rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str).str.replace(".0", "", regex=False)
     rounds["match_id"] = rounds["match_id"].astype(str).replace("nan", "legacy")
     
@@ -77,35 +75,22 @@ def calculate_new_handicap(current_hcp, score):
         elif score < 27: return current_hcp + 1.0
         else: return current_hcp
 
-# --- CRITICAL: REPLAY HISTORY ENGINE ---
 def recalculate_all_handicaps(df_rounds, df_players):
-    """
-    Resets everyone to start_handicap, then replays every round chronologically
-    to calculate the true current handicap.
-    """
-    # 1. Reset all handicaps to start_handicap
-    # Create a map for fast lookup: {player_name: current_hcp}
     hcp_map = {}
     for idx, row in df_players.iterrows():
         hcp_map[row["name"]] = row["start_handicap"]
         
-    # 2. Sort rounds by date (Oldest to Newest)
     if not df_rounds.empty:
         sorted_rounds = df_rounds.sort_values("date", ascending=True)
-        
-        # 3. Replay History
         for idx, row in sorted_rounds.iterrows():
             if row["match_type"] == "Standard":
                 p_name = row["player_name"]
                 score = row["stableford_score"]
-                
-                # Only calc if player exists in map
                 if p_name in hcp_map:
                     old_hcp = hcp_map[p_name]
                     new_hcp = calculate_new_handicap(old_hcp, score)
                     hcp_map[p_name] = new_hcp
     
-    # 4. Update dataframe
     for idx, row in df_players.iterrows():
         if row["name"] in hcp_map:
             df_players.at[idx, "handicap"] = hcp_map[row["name"]]
@@ -128,16 +113,30 @@ def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, c
     if is_road: total += 2; breakdown.append("Road(+2)")
     if is_hio: total += 10; breakdown.append("HIO(+10)")
         
+    # --- UPDATED: SPLIT POT LOGIC ---
     if group_data:
         best_score = max(p['score'] for p in group_data)
+        
+        # 1. Check if I am a winner
         if score == best_score:
-            n = len(group_data)
-            wb = 0
-            if n == 2: wb = 2
-            elif n == 3: wb = 4
-            elif n >= 4: wb = 6
-            if is_9: wb = int(wb / 2)
-            if wb > 0: total += wb; breakdown.append(f"Win(+{wb})")
+            # 2. Count TOTAL winners to split pot
+            winners_count = sum(1 for p in group_data if p['score'] == best_score)
+            
+            # 3. Determine Total Pot
+            n_players = len(group_data)
+            total_pot = 0
+            if n_players == 2: total_pot = 2
+            elif n_players == 3: total_pot = 4
+            elif n_players >= 4: total_pot = 6
+            
+            if is_9: total_pot = total_pot / 2  # Keep as float for math
+            
+            # 4. Calculate Share (Round UP)
+            share = math.ceil(total_pot / winners_count)
+            
+            if share > 0:
+                total += int(share)
+                breakdown.append(f"Win(+{int(share)})")
     
     if group_data and current_player in player_rp_map:
         my_total = player_rp_map.get(current_player, 0)
@@ -485,11 +484,9 @@ with tab_history:
                     t = g.iloc[0]
                     for c in ["date", "course", "match_type", "holes_played", "match_id"]: save_df[c] = t[c]
                     
-                    # 1. Update Rounds DB
                     new_rounds_db = pd.concat([df_rounds, save_df], ignore_index=True)
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
                     
-                    # 2. Replay History to Fix Handicaps
                     recalc_players = recalculate_all_handicaps(new_rounds_db, df_players)
                     conn.update(worksheet="players", data=recalc_players, spreadsheet=SPREADSHEET_NAME)
                     
@@ -498,11 +495,9 @@ with tab_history:
                     st.rerun()
                     
                 if col_d.button("Delete Match", key=f"d_{grp['key']}"):
-                    # 1. Delete Round
                     new_rounds_db = df_rounds.drop(g.index)
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
                     
-                    # 2. Replay History
                     recalc_players = recalculate_all_handicaps(new_rounds_db, df_players)
                     conn.update(worksheet="players", data=recalc_players, spreadsheet=SPREADSHEET_NAME)
                     
