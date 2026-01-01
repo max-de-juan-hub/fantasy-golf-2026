@@ -15,17 +15,18 @@ SPREADSHEET_NAME = "fantasy_golf_db"
 
 # --- HELPER FUNCTIONS ---
 def load_data(conn):
-    # FORCE CLEAR CACHE on every load to ensure fresh data
+    # FORCE CLEAR CACHE
     st.cache_data.clear()
     
     try:
+        # Read raw data with no caching
         players = conn.read(worksheet="players", spreadsheet=SPREADSHEET_NAME, ttl=0)
         rounds = conn.read(worksheet="rounds", spreadsheet=SPREADSHEET_NAME, ttl=0)
     except Exception as e:
-        st.error(f"CRITICAL ERROR: Could not connect to Google Sheets. {e}")
+        st.error(f"Connection Error: {e}")
         return pd.DataFrame(), pd.DataFrame()
     
-    # 1. Ensure Columns
+    # 1. Fill Missing Columns (Safety)
     defaults = {
         "holes_played": "18", "gross_score": 0, "match_type": "Standard", 
         "notes": "", "stableford_score": 0, "rp_earned": 0, "course": "Unknown",
@@ -35,15 +36,21 @@ def load_data(conn):
         if col not in rounds.columns: 
             rounds[col] = val
 
-    # 2. CLEAN UP NUMBERS
+    # 2. Robust Type Conversion
     rounds["holes_played"] = rounds["holes_played"].fillna("18").astype(str)
+    
     for col in ["gross_score", "stableford_score", "rp_earned"]:
         rounds[col] = pd.to_numeric(rounds[col], errors='coerce').fillna(0).astype(int)
 
-    # 3. CLEAN UP DATES (Handle mixed formats)
-    # We try mixed format first, then coerce errors
-    rounds["date"] = pd.to_datetime(rounds["date"], dayfirst=True, errors='coerce')
-    rounds = rounds.dropna(subset=["date"])
+    # 3. UNBREAKABLE DATE PARSING
+    # If date parsing fails, we DO NOT delete the row. We set it to Today.
+    rounds["date_parsed"] = pd.to_datetime(rounds["date"], dayfirst=True, errors='coerce')
+    
+    # If "date_parsed" is NaT (Not a Time), fill it with Today's date
+    rounds["date"] = rounds["date_parsed"].fillna(pd.Timestamp.now())
+    
+    # Drop the temporary column
+    rounds = rounds.drop(columns=["date_parsed"])
     
     return players, rounds
 
@@ -108,12 +115,6 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 df_players, df_rounds = load_data(conn)
 player_list = df_players["name"].tolist() if not df_players.empty else []
 
-# DEBUG INDICATOR
-if not df_rounds.empty:
-    st.toast(f"✅ Data Loaded: Found {len(df_rounds)} historical rounds.", icon="📊")
-else:
-    st.error("⚠️ Warning: No rounds found in database (or connection failed).")
-
 # --- 1. STATS ENGINE ---
 stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
 for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: stats[c] = 0
@@ -123,12 +124,19 @@ current_rp_map = {}
 if not df_rounds.empty:
     for i, r in df_rounds.iterrows():
         p, rp = r["player_name"], r["rp_earned"]
-        if p in stats.index and pd.notnull(r["date"]):
+        if p in stats.index:
+            # RP Totals
             stats.at[p, "Tournament 1 Ranking Points"] += rp
             current_rp_map[p] = stats.at[p, "Tournament 1 Ranking Points"]
-            s = get_season(r["date"])
-            if s in stats.columns: stats.at[p, s] += rp
-            if r["match_type"] in ["Standard", "Duel"]: stats.at[p, "Rounds"] += 1
+            
+            # Season (Safe check)
+            if pd.notnull(r["date"]):
+                s = get_season(r["date"])
+                if s in stats.columns: stats.at[p, s] += rp
+            
+            # Rounds Count
+            if r["match_type"] in ["Standard", "Duel"]:
+                stats.at[p, "Rounds"] += 1
 
     std_18 = df_rounds[(df_rounds["holes_played"] == "18") & (df_rounds["match_type"] == "Standard")]
     if not std_18.empty:
