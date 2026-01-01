@@ -107,12 +107,10 @@ player_list = df_players["name"].tolist() if not df_players.empty else []
 
 # --- 1. STATS ENGINE ---
 stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
-# Initialize all columns
+# Init columns with 0
 for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: 
     stats[c] = 0
 stats["2v2 Record"] = "0-0-0"
-# Set Best Gross to a high number initially so min() works, or handle 0s later. 
-# Better: Keep 0, but filter > 0 when displaying/calculating.
 
 current_rp_map = {}
 
@@ -128,7 +126,7 @@ if not df_rounds.empty:
     for s in ["Season 1", "Season 2"]:
         if s in season_rp.columns: stats[s] = stats[s].add(season_rp[s], fill_value=0)
 
-    # 3. ROUNDS PLAYED (Standard + Duel + Alliance)
+    # 3. ROUNDS PLAYED
     rounds_count = df_rounds.groupby("player_name").size()
     stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
 
@@ -138,7 +136,7 @@ if not df_rounds.empty:
         avg = std_matches.groupby("player_name")["stableford_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
 
-    # 5. BEST GROSS (Standard + Duel 18H) - FIX: Use min() of > 0
+    # 5. BEST GROSS (Standard + Duel 18H)
     valid_gross = df_rounds[
         (df_rounds["holes_played"] == "18") & 
         (df_rounds["match_type"].isin(["Standard", "Duel"])) & 
@@ -149,7 +147,7 @@ if not df_rounds.empty:
         for p, val in best.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
-    # 6. DAILY WINS (Standard + Duel + Alliance)
+    # 6. DAILY WINS
     if not std_matches.empty:
         for mid, group in std_matches.groupby("match_id"):
             max_s = group["stableford_score"].max()
@@ -186,7 +184,6 @@ def resolve_tie(cand, metric):
     if len(cand) == 1: return cand.index[0]
     # For Gross, LOWER is better.
     is_gross = (metric == "Best Gross")
-    # Filter non-zero for gross
     if is_gross: 
         cand = cand[cand[metric] > 0]
         if cand.empty: return None
@@ -201,13 +198,13 @@ def resolve_tie(cand, metric):
     tied_wins = tied[tied["Daily Wins"] == best_wins]
     return tied_wins.index[0] if len(tied_wins) == 1 else "Tied"
 
-# Rock (Avg Score, Min 3 Rounds)
+# Rock
 q_rock = stats[stats["Rounds"] >= 3]
 if not q_rock.empty:
     holder_rock = resolve_tie(q_rock, "Avg Score")
     if holder_rock and holder_rock != "Tied": stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
 
-# Sniper (Month Best Gross) - Re-calc locally to ensure accuracy
+# Sniper
 curr = datetime.date.today()
 m_rnds = df_rounds[
     (df_rounds["date"].dt.month == curr.month) & 
@@ -228,7 +225,7 @@ if not m_rnds.empty:
     if holder_sniper and holder_sniper != "Tied" and holder_sniper in stats.index: 
         stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
 
-# Conqueror (Most Wins, Min 3 Rounds)
+# Conqueror
 q_conq = stats[stats["Rounds"] >= 3]
 if not q_conq.empty:
     holder_conq = resolve_tie(q_conq, "Daily Wins")
@@ -251,12 +248,11 @@ tab_leaderboard, tab_trophy, tab_submit, tab_history, tab_admin, tab_rules = st.
 with tab_leaderboard:
     st.header("Live Standings")
     
-    # Prepare Display Data
+    # Copy & Prepare
     v = stats.copy()
     v["1v1 Record"] = v["1v1 Wins"].astype(int).astype(str) + "-" + v["1v1 Losses"].astype(int).astype(str)
     
-    # RENAME & REORDER
-    # Desired: Player, T1, HCP, Daily Wins, Best Round, Avg Stableford, Rounds Played, 1v1, 2v2, S1, S2
+    # RENAME FOR DISPLAY ONLY
     v = v.rename(columns={
         "handicap": "Handicap", 
         "Best Gross": "Best Round", 
@@ -272,7 +268,6 @@ with tab_leaderboard:
         "2v2 Record", "Season 1 RP", "Season 2 RP"
     ]
     
-    # Filter to existing cols just in case
     final_cols = [c for c in cols_order if c in v.columns]
     v = v[final_cols]
 
@@ -296,14 +291,13 @@ with tab_trophy:
     st.header("🏆 The Hall of Fame")
     def txt(h, v, l): return "TIED\n*(Requires Head-to-Head)*" if h == "Tied" else (f"{h}\n\n*({v} {l})*" if h else "Unclaimed")
     
-    # Get Value safely
+    # USE INTERNAL NAMES TO GET VALUES (Avg Score, Daily Wins)
     def get_val(holder, metric):
         if not holder or holder == "Tied": return 0
         val = stats.loc[stats["player_name"] == holder, metric]
         return val.values[0] if not val.empty else 0
 
-    rv = get_val(holder_rock, "Average Stableford")
-    # For Sniper, we use the calculated month min, not season best
+    rv = get_val(holder_rock, "Avg Score")
     sv = min_g if holder_sniper and holder_sniper != "Tied" else 0
     cv = get_val(holder_conq, "Daily Wins")
     
