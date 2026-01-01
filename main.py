@@ -14,6 +14,15 @@ st.set_page_config(
 # --- CONSTANTS ---
 SPREADSHEET_NAME = "fantasy_golf_db"
 
+# --- HELPER: NUMBER FORMATTING ---
+def fmt_num(val):
+    """Format numbers: No decimals if integer, max 2 decimals if float."""
+    if pd.isnull(val): return "-"
+    if val == 0: return "0"
+    if val % 1 == 0:
+        return f"{int(val)}"
+    return f"{val:.2f}"
+
 # --- HELPER FUNCTIONS ---
 def load_data(conn):
     st.cache_data.clear()
@@ -24,6 +33,13 @@ def load_data(conn):
         st.error(f"Connection Error: {e}")
         return pd.DataFrame(), pd.DataFrame()
     
+    # 1. Player Data Safety
+    if "handicap" not in players.columns: players["handicap"] = 0.0
+    # Create start_handicap if missing (for Rocket Award)
+    if "start_handicap" not in players.columns: 
+        players["start_handicap"] = players["handicap"]
+
+    # 2. Round Data Safety
     defaults = {
         "holes_played": "18", "gross_score": 0, "match_type": "Standard", 
         "notes": "", "stableford_score": 0, "rp_earned": 0, "course": "Unknown",
@@ -107,7 +123,6 @@ player_list = df_players["name"].tolist() if not df_players.empty else []
 
 # --- 1. STATS ENGINE ---
 stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
-# Init columns with 0
 for c in ["Tournament 1 Ranking Points", "Season 1", "Season 2", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins"]: 
     stats[c] = 0
 stats["2v2 Record"] = "0-0-0"
@@ -115,39 +130,41 @@ stats["2v2 Record"] = "0-0-0"
 current_rp_map = {}
 
 if not df_rounds.empty:
-    # 1. Total RP & Map
+    # Total RP
     total_rp = df_rounds.groupby("player_name")["rp_earned"].sum()
     stats["Tournament 1 Ranking Points"] = stats["Tournament 1 Ranking Points"].add(total_rp, fill_value=0)
     for p, val in total_rp.items(): current_rp_map[p] = val
 
-    # 2. Season RP
+    # Seasons
     df_rounds["season"] = df_rounds["date"].apply(get_season)
     season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
     for s in ["Season 1", "Season 2"]:
         if s in season_rp.columns: stats[s] = stats[s].add(season_rp[s], fill_value=0)
 
-    # 3. ROUNDS PLAYED
+    # Rounds Played (Count everything)
     rounds_count = df_rounds.groupby("player_name").size()
     stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
 
-    # 4. AVG SCORE (Standard Only)
+    # Avg Score (Standard Only)
     std_matches = df_rounds[df_rounds["match_type"] == "Standard"]
     if not std_matches.empty:
         avg = std_matches.groupby("player_name")["stableford_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
 
-    # 5. BEST GROSS (Standard + Duel 18H)
-    valid_gross = df_rounds[
-        (df_rounds["holes_played"] == "18") & 
-        (df_rounds["match_type"].isin(["Standard", "Duel"])) & 
+    # Best Gross (Month Best - for Leaderboard Column as requested)
+    curr = datetime.date.today()
+    month_rnds = df_rounds[
+        (df_rounds["date"].dt.month == curr.month) & 
+        (df_rounds["date"].dt.year == curr.year) & 
+        (df_rounds["holes_played"] == "18") &
         (df_rounds["gross_score"] > 0)
     ]
-    if not valid_gross.empty:
-        best = valid_gross.groupby("player_name")["gross_score"].min()
-        for p, val in best.items():
+    if not month_rnds.empty:
+        best_month = month_rnds.groupby("player_name")["gross_score"].min()
+        for p, val in best_month.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
-    # 6. DAILY WINS
+    # Daily Wins
     if not std_matches.empty:
         for mid, group in std_matches.groupby("match_id"):
             max_s = group["stableford_score"].max()
@@ -161,7 +178,7 @@ if not df_rounds.empty:
         for w in winners:
             if w in stats.index: stats.at[w, "Daily Wins"] += 1
 
-    # 7. RECORDS
+    # Records
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
         w = duels[duels["rp_earned"] > 0].groupby("player_name").size()
@@ -178,13 +195,14 @@ if not df_rounds.empty:
             stats.at[p, "2v2 Record"] = f"{int(w.get(p,0))}-{int(t.get(p,0))}-{int(l.get(p,0))}"
 
 # --- 2. TROPHY LOGIC ---
-holder_rock, holder_sniper, holder_conq = None, None, None
+holder_rock, holder_sniper, holder_conq, holder_rocket = None, None, None, None
 
 def resolve_tie(cand, metric):
     if len(cand) == 1: return cand.index[0]
-    # For Gross, LOWER is better.
     is_gross = (metric == "Best Gross")
-    if is_gross: 
+    
+    if is_gross:
+        # Filter 0s
         cand = cand[cand[metric] > 0]
         if cand.empty: return None
         best_val = cand[metric].min()
@@ -198,34 +216,36 @@ def resolve_tie(cand, metric):
     tied_wins = tied[tied["Daily Wins"] == best_wins]
     return tied_wins.index[0] if len(tied_wins) == 1 else "Tied"
 
-# Rock
+# Rock (Avg Score, Min 3 Rounds)
 q_rock = stats[stats["Rounds"] >= 3]
 if not q_rock.empty:
     holder_rock = resolve_tie(q_rock, "Avg Score")
     if holder_rock and holder_rock != "Tied": stats.at[holder_rock, "Tournament 1 Ranking Points"] += 10
 
-# Sniper
-curr = datetime.date.today()
-m_rnds = df_rounds[
-    (df_rounds["date"].dt.month == curr.month) & 
-    (df_rounds["date"].dt.year == curr.year) & 
-    (df_rounds["gross_score"] > 0) & 
-    (df_rounds["holes_played"] == "18") &
-    (df_rounds["match_type"].isin(["Standard", "Duel"]))
-]
-if not m_rnds.empty:
-    min_g = m_rnds["gross_score"].min()
-    s_list = m_rnds[m_rnds["gross_score"] == min_g]["player_name"].unique()
-    
-    if len(s_list) == 1: holder_sniper = s_list[0]
-    else: 
-        s_stats = stats[stats.index.isin(s_list)]
-        holder_sniper = resolve_tie(s_stats, "Daily Wins")
-        
-    if holder_sniper and holder_sniper != "Tied" and holder_sniper in stats.index: 
+# Rocket (HCP Reduction: Start - Current)
+# Calculate reduction for everyone
+stats["HCP Reduction"] = stats.apply(
+    lambda row: df_players.loc[df_players["name"]==row.name, "start_handicap"].values[0] - row["handicap"] 
+    if row.name in df_players["name"].values else 0, axis=1
+)
+q_rocket = stats[stats["Rounds"] >= 3]
+if not q_rocket.empty:
+    # Filter for reduction > 0
+    q_rocket = q_rocket[q_rocket["HCP Reduction"] > 0]
+    if not q_rocket.empty:
+        holder_rocket = resolve_tie(q_rocket, "HCP Reduction")
+        if holder_rocket and holder_rocket != "Tied":
+            stats.at[holder_rocket, "Tournament 1 Ranking Points"] += 10
+
+# Sniper (Month Best Gross)
+# Use stats["Best Gross"] which we already filtered for this month above
+q_sniper = stats[stats["Best Gross"] > 0]
+if not q_sniper.empty:
+    holder_sniper = resolve_tie(q_sniper, "Best Gross")
+    if holder_sniper and holder_sniper != "Tied": 
         stats.at[holder_sniper, "Tournament 1 Ranking Points"] += 5
 
-# Conqueror
+# Conqueror (Most Wins, Min 3 Rounds)
 q_conq = stats[stats["Rounds"] >= 3]
 if not q_conq.empty:
     holder_conq = resolve_tie(q_conq, "Daily Wins")
@@ -238,6 +258,7 @@ def decorate(row):
     if n == holder_rock: i += " 🪨"
     if n == holder_sniper: i += " 🎯"
     if n == holder_conq: i += " 👑"
+    if n == holder_rocket: i += " 🚀"
     return f"{n}{i}"
 stats["Player"] = stats.apply(decorate, axis=1)
 
@@ -247,12 +268,10 @@ tab_leaderboard, tab_trophy, tab_submit, tab_history, tab_admin, tab_rules = st.
 
 with tab_leaderboard:
     st.header("Live Standings")
-    
-    # Copy & Prepare
     v = stats.copy()
     v["1v1 Record"] = v["1v1 Wins"].astype(int).astype(str) + "-" + v["1v1 Losses"].astype(int).astype(str)
     
-    # RENAME FOR DISPLAY ONLY
+    # RENAME
     v = v.rename(columns={
         "handicap": "Handicap", 
         "Best Gross": "Best Round", 
@@ -267,39 +286,39 @@ with tab_leaderboard:
         "Best Round", "Average Stableford", "Rounds Played", "1v1 Record", 
         "2v2 Record", "Season 1 RP", "Season 2 RP"
     ]
-    
     final_cols = [c for c in cols_order if c in v.columns]
     v = v[final_cols]
+
+    # Convert everything to formatted strings for display (To remove decimals)
+    for col in v.columns:
+        if col not in ["Player", "1v1 Record", "2v2 Record"]:
+            v[col] = v[col].apply(fmt_num)
 
     def color_row(row):
         if row.name == 0: return ['background-color: #FFA500; color: black'] * len(row)
         if 1 <= row.name <= 3: return ['background-color: #FFFFE0; color: black'] * len(row)
         return [''] * len(row)
 
-    st.dataframe(
-        v.style.apply(color_row, axis=1).format({
-            "Handicap": "{:.0f}", 
-            "Average Stableford": "{:.2f}",
-            "Best Round": "{:.0f}"
-        }), 
-        use_container_width=True, 
-        hide_index=True
-    )
+    st.dataframe(v.style.apply(color_row, axis=1), use_container_width=True, hide_index=True)
     st.caption("🔶 **Orange:** Leader | 🟡 **Yellow:** Top 4 | 🏆 **Bonuses:** 🪨 Rock(+10) 🎯 Sniper(+5) 👑 Conqueror(+10)")
 
 with tab_trophy:
     st.header("🏆 The Hall of Fame")
-    def txt(h, v, l): return "TIED\n*(Requires Head-to-Head)*" if h == "Tied" else (f"{h}\n\n*({v} {l})*" if h else "Unclaimed")
+    def txt(h, v, l): 
+        if h == "Tied": return "TIED\n*(Head-to-Head)*"
+        return f"{h}\n\n*({fmt_num(v)} {l})*" if h else "Unclaimed"
     
-    # USE INTERNAL NAMES TO GET VALUES (Avg Score, Daily Wins)
     def get_val(holder, metric):
         if not holder or holder == "Tied": return 0
+        # Check raw stats df before formatting
+        # stats is now reset_index, so player_name is a column
         val = stats.loc[stats["player_name"] == holder, metric]
         return val.values[0] if not val.empty else 0
 
     rv = get_val(holder_rock, "Avg Score")
-    sv = min_g if holder_sniper and holder_sniper != "Tied" else 0
+    sv = get_val(holder_sniper, "Best Gross")
     cv = get_val(holder_conq, "Daily Wins")
+    rkv = get_val(holder_rocket, "HCP Reduction")
     
     st.markdown("""<style>.trophy-card { background-color: #262730; padding: 20px; border-radius: 10px; border: 1px solid #4B4B4B; text-align: center; } .t-icon { font-size: 40px; } .t-head { font-size: 18px; font-weight: bold; color: #FFD700; margin-top: 5px; } .t-sub { font-size: 12px; color: #A0A0A0; margin-bottom: 10px; } .t-name { font-size: 20px; font-weight: bold; color: white; } .t-bonus { color: #00FF00; font-weight: bold; font-size: 14px; margin-top: 5px; }</style>""", unsafe_allow_html=True)
     
@@ -308,7 +327,7 @@ with tab_trophy:
 
     c1, c2, c3, c4 = st.columns(4)
     card(c1, "🪨", "The Rock", "Best Avg", txt(holder_rock, rv, "Avg"), "+10", "Min 3 Rounds")
-    card(c2, "🚀", "The Rocket", "Biggest HCP Drop", "Unclaimed", "+10", "Min 3 Rounds")
+    card(c2, "🚀", "The Rocket", "Biggest HCP Drop", txt(holder_rocket, rkv, "Drop"), "+10", "Min 3 Rounds")
     card(c3, "🎯", "The Sniper", "Best Gross (Month)", txt(holder_sniper, sv, "Strks"), "+5", "Std or 1v1 (18H)")
     card(c4, "👑", "The Conqueror", "Most Wins", txt(holder_conq, cv, "Wins"), "+10", "Min 3 Rounds")
 
