@@ -63,16 +63,21 @@ def load_data(conn):
     
     return players, rounds
 
-def calculate_new_handicap(current_hcp, score):
+def calculate_new_handicap(current_hcp, score, holes="18"):
+    # NORMALIZE 9-HOLE SCORES TO 18-HOLE SCALE
+    # If 9 holes, we assume score * 2 equates to 18-hole performance for HCP adjustment
+    is_9 = (str(holes) == "9")
+    eff_score = score * 2 if is_9 else score
+    
     current_hcp = float(current_hcp)
-    score = int(score)
+    
     if current_hcp > 36.0:
-        if score > 36: return max(0.0, current_hcp - float(score - 36))
-        else: return current_hcp if score >= 27 else current_hcp + 1.0
+        if eff_score > 36: return max(0.0, current_hcp - float(eff_score - 36))
+        else: return current_hcp if eff_score >= 27 else current_hcp + 1.0
     else:
-        if score >= 40: return max(0.0, current_hcp - 2.0)
-        elif score >= 37: return max(0.0, current_hcp - 1.0)
-        elif score < 27: return current_hcp + 1.0
+        if eff_score >= 40: return max(0.0, current_hcp - 2.0)
+        elif eff_score >= 37: return max(0.0, current_hcp - 1.0)
+        elif eff_score < 27: return current_hcp + 1.0
         else: return current_hcp
 
 def recalculate_all_handicaps(df_rounds, df_players):
@@ -86,9 +91,11 @@ def recalculate_all_handicaps(df_rounds, df_players):
             if row["match_type"] == "Standard":
                 p_name = row["player_name"]
                 score = row["stableford_score"]
+                holes = row["holes_played"]
+                
                 if p_name in hcp_map:
                     old_hcp = hcp_map[p_name]
-                    new_hcp = calculate_new_handicap(old_hcp, score)
+                    new_hcp = calculate_new_handicap(old_hcp, score, holes)
                     hcp_map[p_name] = new_hcp
     
     for idx, row in df_players.iterrows():
@@ -100,7 +107,11 @@ def recalculate_all_handicaps(df_rounds, df_players):
 def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, current_player, player_rp_map):
     breakdown = []
     is_9 = (str(holes) == "9")
-    part_pts = 1 if is_9 else 2
+    
+    # --- 1. UPDATED PARTICIPATION ---
+    # 9H = +2, 18H = +4
+    part_pts = 2 if is_9 else 4
+    
     target = 18 if is_9 else 36
     diff = score - target
     perf_pts = diff * 2 if diff >= 0 else int(diff / 2)
@@ -109,29 +120,30 @@ def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, c
     breakdown.append(f"Perf({'+' if perf_pts>0 else ''}{perf_pts})")
     total = part_pts + perf_pts
     
-    if is_clean and not is_9: total += 2; breakdown.append("Clean(+2)")
+    # --- 2. UPDATED CLEAN SHEET ---
+    # 9H = +1, 18H = +3
+    if is_clean:
+        cs_pts = 1 if is_9 else 3
+        total += cs_pts
+        breakdown.append(f"Clean(+{cs_pts})")
+        
     if is_road: total += 2; breakdown.append("Road(+2)")
     if is_hio: total += 10; breakdown.append("HIO(+10)")
         
-    # --- UPDATED: SPLIT POT LOGIC ---
     if group_data:
         best_score = max(p['score'] for p in group_data)
         
-        # 1. Check if I am a winner
         if score == best_score:
-            # 2. Count TOTAL winners to split pot
             winners_count = sum(1 for p in group_data if p['score'] == best_score)
             
-            # 3. Determine Total Pot
             n_players = len(group_data)
             total_pot = 0
             if n_players == 2: total_pot = 2
             elif n_players == 3: total_pot = 4
             elif n_players >= 4: total_pot = 6
             
-            if is_9: total_pot = total_pot / 2  # Keep as float for math
+            if is_9: total_pot = total_pot / 2
             
-            # 4. Calculate Share (Round UP)
             share = math.ceil(total_pot / winners_count)
             
             if share > 0:
@@ -184,10 +196,16 @@ if not df_rounds.empty and not stats.empty:
 
     std_matches = df_rounds[df_rounds["match_type"] == "Standard"]
     if not std_matches.empty:
-        avg = std_matches.groupby("player_name")["stableford_score"].mean()
+        # NORMALIZE SCORES FOR "THE ROCK" AWARD
+        # Create a temp column where 9-hole scores are doubled
+        std_matches["norm_score"] = std_matches.apply(
+            lambda r: r["stableford_score"] * 2 if r["holes_played"] == "9" else r["stableford_score"], axis=1
+        )
+        avg = std_matches.groupby("player_name")["norm_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
 
     curr = datetime.date.today()
+    # SNIPER AWARD: STRICTLY 18 HOLES
     month_rnds = df_rounds[
         (df_rounds["date"].dt.month == curr.month) & 
         (df_rounds["date"].dt.year == curr.year) & 
@@ -384,7 +402,7 @@ with tab_submit:
                         for d in input_data:
                             rp, note = calculate_standard_rp(d['score'], hl, d['cl'], d['rw'], d['ho'], group_scores, d['name'], current_rp_map)
                             curr_hcp = df_players.loc[df_players["name"] == d['name'], "handicap"].values[0]
-                            new_hcp = calculate_new_handicap(curr_hcp, d['score'])
+                            new_hcp = calculate_new_handicap(curr_hcp, d['score'], hl)
                             df_players.loc[df_players["name"] == d['name'], "handicap"] = new_hcp
                             new_rows.append({"date": str(dt), "course": crs, "player_name": d['name'], "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], "rp_earned": rp, "notes": note, "match_type": "Standard", "match_id": batch_id})
                         conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
