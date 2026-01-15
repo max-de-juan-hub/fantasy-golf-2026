@@ -74,18 +74,47 @@ def get_season(date_obj):
     return "Off-Season"
 
 def calculate_new_handicap(current_hcp, score, holes="18"):
+    # Normalize 9-hole scores
     is_9 = (str(holes) == "9")
     eff_score = score * 2 if is_9 else score
     current_hcp = float(current_hcp)
     
+    # --- SANDBAGGER PROTOCOL (> 36.0) ---
     if current_hcp > 36.0:
-        if eff_score > 36: return max(0.0, current_hcp - float(eff_score - 36))
-        else: return current_hcp if eff_score >= 27 else current_hcp + 1.0
-    else:
-        if eff_score >= 40: return max(0.0, current_hcp - 2.0)
-        elif eff_score >= 37: return max(0.0, current_hcp - 1.0)
-        elif eff_score < 27: return current_hcp + 1.0
-        else: return current_hcp
+        if eff_score > 36:
+            # Drop 1.0 per point over 36, CAPPED at 10.0
+            drop = float(eff_score - 36)
+            actual_drop = min(drop, 10.0)
+            return max(0.0, current_hcp - actual_drop)
+        else:
+            # For bad rounds > 36, apply standard bad day logic (+1.0)
+            if eff_score <= 33: return current_hcp + 1.0 
+            return current_hcp # 34-36 zone
+
+    # --- STANDARD ADJUSTMENTS (<= 36.0) ---
+    # God Day (45+)
+    if eff_score >= 45: 
+        return max(0.0, current_hcp - 5.0)
+    
+    # On Fire (40-44)
+    elif eff_score >= 40: 
+        return max(0.0, current_hcp - 2.0)
+    
+    # Good Day (37-39)
+    elif eff_score >= 37: 
+        return max(0.0, current_hcp - 1.0)
+    
+    # The Zone (34-36)
+    elif eff_score >= 34: 
+        return current_hcp
+    
+    # Bad Day (30-33)
+    elif eff_score >= 30: 
+        return current_hcp + 1.0
+    
+    # Disaster Day (< 30)
+    else: 
+        return current_hcp + 2.0
 
 def recalculate_all_handicaps(df_rounds, df_players):
     hcp_map = {}
@@ -116,7 +145,6 @@ def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, c
     # --- 1. PARTICIPATION (WITH CAP) ---
     potential_part = 2 if is_9 else 4
     
-    # Check remaining cap space
     remaining_cap = MAX_PARTICIPATION_RP - current_season_part_rp
     actual_part = min(potential_part, max(0, remaining_cap))
     
@@ -187,25 +215,19 @@ current_rp_map = {}
 if not df_rounds.empty and not stats.empty:
     df_rounds["season"] = df_rounds["date"].apply(get_season)
     
-    # 1. Base RP & Participation Tracking
-    # Sum RP by season
     season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
-    # Sum Participation RP by season (for Cap tracking)
     part_rp_sum = df_rounds.groupby(["player_name", "season"])["part_rp"].sum().unstack(fill_value=0)
     
     for s in ["Season 1", "Season 2"]:
         if s in season_rp.columns: 
             stats[s] = stats[s].add(season_rp[s], fill_value=0)
         if s in part_rp_sum.columns:
-            # Map column names: Season 1 -> Part RP S1
             target_col = "Part RP S1" if s == "Season 1" else "Part RP S2"
             stats[target_col] = stats[target_col].add(part_rp_sum[s], fill_value=0)
 
-    # 2. Rounds Count
     rounds_count = df_rounds.groupby("player_name").size()
     stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
 
-    # 3. Avg Score (Standard)
     std_matches = df_rounds[df_rounds["match_type"] == "Standard"]
     if not std_matches.empty:
         std_matches["norm_score"] = std_matches.apply(
@@ -214,7 +236,6 @@ if not df_rounds.empty and not stats.empty:
         avg = std_matches.groupby("player_name")["norm_score"].mean()
         stats["Avg Score"] = stats["Avg Score"].add(avg, fill_value=0)
 
-    # 4. Best Gross (Month)
     curr = datetime.date.today()
     month_rnds = df_rounds[
         (df_rounds["date"].dt.month == curr.month) & 
@@ -228,7 +249,6 @@ if not df_rounds.empty and not stats.empty:
         for p, val in best_month.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
 
-    # 5. Daily Wins
     if not std_matches.empty:
         for mid, group in std_matches.groupby("match_id"):
             max_s = group["stableford_score"].max()
@@ -242,7 +262,6 @@ if not df_rounds.empty and not stats.empty:
         for w in winners:
             if w in stats.index: stats.at[w, "Daily Wins"] += 1
 
-    # 6. Records
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
         w = duels[duels["rp_earned"] > 0].groupby("player_name").size()
@@ -263,7 +282,6 @@ holder_rock, holder_sniper, holder_conq, holder_rocket = None, None, None, None
 
 current_season = get_season(datetime.datetime.now())
 current_season_col = "Bonus RP S1" if current_season == "Season 1" else "Bonus RP S2"
-# If off-season, default to S1 for now
 if current_season == "Off-Season": current_season_col = "Bonus RP S1" 
 
 def resolve_tie(cand, metric):
@@ -336,11 +354,9 @@ with tab_leaderboard:
         v["1v1 Record"] = v["1v1 Wins"].astype(int).astype(str) + "-" + v["1v1 Losses"].astype(int).astype(str)
         v = v.rename(columns={"handicap": "Handicap", "Best Gross": "Best Round", "Avg Score": "Average Stableford", "Rounds": "Rounds Played", "Season 1": "Season 1 RP", "Season 2": "Season 2 RP"})
         
-        # Determine which participation column to show based on current season
         curr_part_col = "Part RP S1" if current_season == "Season 1" else "Part RP S2"
         if current_season == "Off-Season": curr_part_col = "Part RP S1"
         
-        # Format the participation column as "12/20"
         v["Part. Cap (20)"] = v[curr_part_col].astype(int).astype(str) + "/20"
 
         cols_order = ["Player", "Tournament 1 Ranking Points", "Handicap", "Daily Wins", "Best Round", "Average Stableford", "Rounds Played", "Part. Cap (20)", "1v1 Record", "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2"]
@@ -356,7 +372,14 @@ with tab_leaderboard:
             if 1 <= row.name <= 3: return ['background-color: #FFFFE0; color: black'] * len(row)
             return [''] * len(row)
 
-        st.dataframe(v.style.apply(color_row, axis=1), use_container_width=True, hide_index=True)
+        st.dataframe(
+            v.style.apply(color_row, axis=1), 
+            use_container_width=True, 
+            hide_index=True,
+            column_config={
+                "Player": st.column_config.TextColumn("Player", width="large")
+            }
+        )
         st.caption("🔶 **Orange:** Leader | 🟡 **Yellow:** Top 4 | 🏆 **Bonuses:** 🪨 Rock(+10) 🎯 Sniper(+5) 👑 Conqueror(+10) 🚀 Rocket(+10)")
 
 with tab_trophy:
@@ -421,20 +444,15 @@ with tab_submit:
                         group_scores = [{'name': d['name'], 'score': d['score']} for d in input_data]
                         
                         # --- PRE-CALC PARTICIPATION CAPS ---
-                        # We need to know current participation points for each player BEFORE adding this round
                         current_season_part_map = {}
                         if not stats.empty:
                             target_col = "Part RP S1" if current_season == "Season 1" else "Part RP S2"
                             if current_season == "Off-Season": target_col = "Part RP S1"
-                            # stats index is player_name (after reset_index, we need to be careful)
-                            # stats was reset_index'd at the end of engine.
-                            # So stats["Player"] is the decorated name, stats["player_name"] is the real name
                             for _, row in stats.iterrows():
                                 current_season_part_map[row["player_name"]] = row[target_col]
 
                         new_rows = []
                         for d in input_data:
-                            # Get current part rp for this player
                             curr_part = current_season_part_map.get(d['name'], 0)
                             
                             rp, note, actual_part_earned = calculate_standard_rp(d['score'], hl, d['cl'], d['rw'], d['ho'], group_scores, d['name'], current_rp_map, curr_part)
@@ -448,7 +466,7 @@ with tab_submit:
                                 "holes_played": hl, "stableford_score": d['score'], 
                                 "gross_score": d['gross'], "rp_earned": rp, 
                                 "notes": note, "match_type": "Standard", "match_id": batch_id,
-                                "part_rp": actual_part_earned  # Store part rp for tracking
+                                "part_rp": actual_part_earned
                             })
                         
                         conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
@@ -478,16 +496,6 @@ with tab_submit:
                         batch_id = f"{dt.strftime('%Y%m%d')}_{int(time.time())}"
                         win_p, lose_p = winner, (p2 if winner == p1 else p1)
                         steal = 10 if "Upset" in stake else 5
-                        base = 2 if hl=="9" else 4 # Updated Participation for Duel too? Usually Part is Std only or both? Assuming Both.
-                        # Wait, logic for Duel participation usually simpler. Let's keep Duel purely as STAKE +/-.
-                        # Rulebook says "Match Bonuses: Part(+2)". Does Duel get participation?
-                        # User said "The Duel (1v1): Winner +5/+10, Loser -5/-10." It implies STAKE ONLY.
-                        # But often participation is added. Let's stick to STAKE ONLY as per strict rules unless requested.
-                        # Actually, looking at previous code, we added "Base" to Duels. 
-                        # Let's apply the same 9H/18H Part logic to Duels for consistency?
-                        # Rulebook "5. RIVALRY CHALLENGES" says "+/- 5". It does NOT mention participation bonus on top.
-                        # Stick to +/- 5.
-                        
                         w_note = f"Duel Win(+{steal})"
                         l_note = f"Duel Loss(-{steal})"
                         rows = [{"date":str(dt), "course":crs, "player_name":win_p, "holes_played":hl, "gross_score":(g1 if win_p==p1 else g2), "rp_earned": steal, "notes":w_note, "match_type":"Duel", "match_id": batch_id, "part_rp": 0}, {"date":str(dt), "course":crs, "player_name":lose_p, "holes_played":hl, "gross_score":(g2 if win_p==p1 else g1), "rp_earned": -steal, "notes":l_note, "match_type":"Duel", "match_id": batch_id, "part_rp": 0}]
@@ -557,7 +565,7 @@ with tab_history:
                     t = g.iloc[0]
                     for c in ["date", "course", "match_type", "holes_played", "match_id", "part_rp"]: 
                         if c in t: save_df[c] = t[c]
-                        else: save_df[c] = 0 # Default if missing
+                        else: save_df[c] = 0
                     
                     new_rounds_db = pd.concat([df_rounds, save_df], ignore_index=True)
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
@@ -635,4 +643,4 @@ with tab_rules:
     with st.expander("3. PERFORMANCE RANKING (RP)"): st.markdown("**Target: 36 Pts (18H) | 18 Pts (9H)**\n* **Positive (>36):** (Score - 36) * 2 = RP Gained.\n* **Negative (<36):** (Score - 36) / 2 = RP Lost.")
     with st.expander("4. BONUSES & AWARDS"): st.markdown("**Match Bonuses:**\n* Part(+2), Win(+2-6), Slayer(+1), Clean(+2), Road(+2), HIO(+10).\n**Seasonal Awards:** Rock, Rocket, Sniper, Conqueror.")
     with st.expander("5. RIVALRY CHALLENGES"): st.markdown("**Alliance (2v2):** +/-5.\n**Duel (1v1):** +/-5 or +/-10.")
-    with st.expander("6. LIVE HANDICAPS"): st.markdown("* **40+ pts:** -2.0\n* **37-39 pts:** -1.0\n* **<27 pts:** +1.0\n* **Away Game:** +3 to +7 shots.")
+    with st.expander("6. LIVE HANDICAPS"): st.markdown(f"""* **God Day (+45pts):** -5.0 \n* **On Fire (40-44pts):** -2.0\n* **Good Day (37-39pts):** -1.0\n* **The Zone (34-36pts):** No Change\n* **Bad Day (30-33pts):** +1.0\n* **Disaster Day (<30pts):** +2.0""")
