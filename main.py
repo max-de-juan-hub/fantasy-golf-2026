@@ -377,7 +377,7 @@ with tab_leaderboard:
             use_container_width=True, 
             hide_index=True,
             column_config={
-                "Player": st.column_config.TextColumn("Player", width="large")
+                "Player": st.column_config.TextColumn("Player", width="medium")
             }
         )
         st.caption("🔶 **Orange:** Leader | 🟡 **Yellow:** Top 4 | 🏆 **Bonuses:** 🪨 Rock(+10) 🎯 Sniper(+5) 👑 Conqueror(+10) 🚀 Rocket(+10)")
