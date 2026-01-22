@@ -60,11 +60,9 @@ def load_data(conn):
     for col in ["gross_score", "stableford_score", "rp_earned", "part_rp"]:
         rounds[col] = pd.to_numeric(rounds[col], errors='coerce').fillna(0).astype(int)
 
-    # --- DATE PARSING ---
-    # Parse dates, coercing errors to NaT
+    # STRICT DATE PARSING
+    # We use dayfirst=True to align with AU/UK formats, but if the Sheet sends YYYY-MM-DD strings, this still works.
     rounds["date_parsed"] = pd.to_datetime(rounds["date"], dayfirst=True, errors='coerce')
-    
-    # Fallback: Fill NaT with today
     rounds["date"] = rounds["date_parsed"].fillna(pd.Timestamp.now())
     rounds = rounds.drop(columns=["date_parsed"])
     
