@@ -60,16 +60,29 @@ def load_data(conn):
     for col in ["gross_score", "stableford_score", "rp_earned", "part_rp"]:
         rounds[col] = pd.to_numeric(rounds[col], errors='coerce').fillna(0).astype(int)
 
-    # --- DATE PARSING STRATEGY ---
-    # 1. Force convert to datetime with dayfirst=True logic
-    rounds["date_parsed"] = pd.to_datetime(rounds["date"], dayfirst=True, errors='coerce')
+    # --- INTELLIGENT DATE REPAIR ---
+    # 1. Parse standard ISO first
+    rounds["date_parsed"] = pd.to_datetime(rounds["date"], errors='coerce')
     
-    # 2. Handle failures
+    # 2. AUTO-FIX: Check for "Future Dates" (The Corruption Indicator)
+    # If a date is > Today, it's likely a Month/Day swap error (e.g., Oct 1st instead of Jan 10th)
+    today_ts = pd.Timestamp.now()
+    
+    def fix_future_date(d):
+        if pd.isnull(d): return d
+        if d > today_ts:
+            # It's in the future. Try swapping Month and Day.
+            try:
+                # Create new date: Year, Day, Month (Swapped)
+                return pd.Timestamp(year=d.year, month=d.day, day=d.month)
+            except:
+                return d # Keep original if swap fails (e.g. 13th month)
+        return d
+
+    rounds["date_parsed"] = rounds["date_parsed"].apply(fix_future_date)
+    
+    # 3. Finalize
     rounds["date"] = rounds["date_parsed"].fillna(pd.Timestamp.now())
-    
-    # 3. Create a clean string column for display/logic
-    rounds["date_str"] = rounds["date"].dt.strftime("%Y-%m-%d")
-    
     rounds = rounds.drop(columns=["date_parsed"])
     
     return players, rounds
@@ -129,7 +142,6 @@ def recalculate_all_handicaps(df_rounds, df_players):
 def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, current_player, player_rp_map, current_season_part_rp):
     breakdown = []
     is_9 = (str(holes) == "9")
-    
     potential_part = 2 if is_9 else 4
     remaining_cap = MAX_PARTICIPATION_RP - current_season_part_rp
     actual_part = min(potential_part, max(0, remaining_cap))
@@ -195,7 +207,6 @@ current_rp_map = {}
 
 if not df_rounds.empty and not stats.empty:
     df_rounds["season"] = df_rounds["date"].apply(get_season)
-    
     season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
     part_rp_sum = df_rounds.groupby(["player_name", "season"])["part_rp"].sum().unstack(fill_value=0)
     
@@ -430,13 +441,17 @@ with tab_submit:
                             new_hcp = calculate_new_handicap(curr_hcp, d['score'], hl)
                             df_players.loc[df_players["name"] == d['name'], "handicap"] = new_hcp
                             
-                            # --- KEY DATE CHANGE FOR SUBMISSION ---
-                            # Submit as YYYY-MM-DD string to be explicit
+                            # --- FORCE STRING DATE ON SAVE ---
                             date_str = dt.strftime("%Y-%m-%d")
                             
                             new_rows.append({"date": date_str, "course": crs, "player_name": d['name'], "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], "rp_earned": rp, "notes": note, "match_type": "Standard", "match_id": batch_id, "part_rp": actual_part_earned})
                         
-                        conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+                        # --- SAFE UPDATE ---
+                        # We convert the entire Date column to string before saving to kill the auto-format
+                        combined_rounds = pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True)
+                        combined_rounds["date"] = combined_rounds["date"].astype(str)
+                        
+                        conn.update(worksheet="rounds", data=combined_rounds, spreadsheet=SPREADSHEET_NAME)
                         conn.update(worksheet="players", data=df_players, spreadsheet=SPREADSHEET_NAME)
                         st.cache_data.clear()
                         st.success(f"Saved {len(selected_players)} rounds! Handicaps updated.")
@@ -469,7 +484,11 @@ with tab_submit:
                         date_str = dt.strftime("%Y-%m-%d")
                         
                         rows = [{"date":date_str, "course":crs, "player_name":win_p, "holes_played":hl, "gross_score":(g1 if win_p==p1 else g2), "rp_earned": steal, "notes":w_note, "match_type":"Duel", "match_id": batch_id, "part_rp": 0}, {"date":date_str, "course":crs, "player_name":lose_p, "holes_played":hl, "gross_score":(g2 if win_p==p1 else g1), "rp_earned": -steal, "notes":l_note, "match_type":"Duel", "match_id": batch_id, "part_rp": 0}]
-                        conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+                        
+                        combined_rounds = pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True)
+                        combined_rounds["date"] = combined_rounds["date"].astype(str)
+                        
+                        conn.update(worksheet="rounds", data=combined_rounds, spreadsheet=SPREADSHEET_NAME)
                         st.cache_data.clear()
                         st.success("Duel Saved!")
                         st.rerun()
@@ -503,7 +522,11 @@ with tab_submit:
                         note = f"Loss ({wh}-{lh})"
                         if bonus: note += ", Duo Debut(+5)"
                         rows.append({"date":date_str, "course":crs, "player_name":p, "holes_played":"18", "rp_earned": -5+bonus, "notes":note, "match_type":"Alliance", "match_id": batch_id, "part_rp": 0})
-                    conn.update(worksheet="rounds", data=pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True), spreadsheet=SPREADSHEET_NAME)
+                    
+                    combined_rounds = pd.concat([df_rounds, pd.DataFrame(rows)], ignore_index=True)
+                    combined_rounds["date"] = combined_rounds["date"].astype(str)
+                    
+                    conn.update(worksheet="rounds", data=combined_rounds, spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
                     st.success("Alliance Saved!")
                     st.rerun()
@@ -516,107 +539,72 @@ with tab_history:
         df_show = df_rounds.copy()
         
         # Display as text to avoid Streamlit/Pandas guessing
-        # We use the clean "date_str" we created in load_data
-        if "date_str" not in df_show.columns:
-             df_show["date_str"] = df_show["date"].dt.strftime("%Y-%m-%d")
+        if "date" in df_show.columns:
+             # Ensure parsed so we can format
+             df_show["_dt"] = pd.to_datetime(df_show["date"], errors='coerce')
+             df_show['display_date'] = df_show['_dt'].dt.strftime('%d-%b-%Y')
+             df_show['sort_val'] = df_show['_dt']
+        else:
+             df_show['display_date'] = "Unknown"
+             df_show['sort_val'] = pd.Timestamp.now()
         
-        # Format for nicer reading DD-MMM-YYYY
-        df_show['display_date'] = pd.to_datetime(df_show['date_str']).dt.strftime('%d-%b-%Y')
-        
-        df_show = df_show.sort_values("date", ascending=False)
+        df_show = df_show.sort_values("sort_val", ascending=False)
         modern = df_show[df_show["match_id"] != "legacy"]
         legacy = df_show[df_show["match_id"] == "legacy"]
         groups = []
         if not modern.empty:
             for m_id, g in modern.groupby("match_id"):
                 first = g.iloc[0]
-                groups.append({"key": m_id, "label": f"📅 {first['display_date']} | {first['course']} | {first['match_type']} ({len(g)} Players)", "data": g, "sort_val": first['date']})
+                groups.append({"key": m_id, "label": f"📅 {first['display_date']} | {first['course']} | {first['match_type']} ({len(g)} Players)", "data": g, "sort_val": first['sort_val']})
         if not legacy.empty:
-            for (d_str, crs, mtype), g in legacy.groupby(['date_str', 'course', 'match_type']):
-                groups.append({"key": f"{d_str}_{crs}", "label": f"📅 {g.iloc[0]['display_date']} | {crs} | {mtype} (Legacy)", "data": g, "sort_val": g.iloc[0]['date']})
+            # Group legacy by date/course
+            for (d_str, crs, mtype), g in legacy.groupby(['date', 'course', 'match_type']):
+                groups.append({"key": f"{d_str}_{crs}", "label": f"📅 {g.iloc[0]['display_date']} | {crs} | {mtype} (Legacy)", "data": g, "sort_val": g.iloc[0]['sort_val']})
         groups.sort(key=lambda x: x['sort_val'], reverse=True)
         
         for grp in groups:
             with st.expander(grp["label"]):
                 g = grp["data"]
-                # Display RAW date string in editor to avoid timezone shifts
-                cols_to_show = ["player_name", "stableford_score", "gross_score", "rp_earned", "notes"]
-                edited = st.data_editor(g[cols_to_show], key=f"e_{grp['key']}", use_container_width=True, num_rows="dynamic")
+                # Show raw columns for editing, hide internal ones
+                cols = ["player_name", "stableford_score", "gross_score", "rp_earned", "notes"]
+                edited = st.data_editor(g[cols], key=f"e_{grp['key']}", use_container_width=True, num_rows="dynamic")
                 col_s, col_d = st.columns([1, 4])
                 if col_s.button("Save Changes", key=f"s_{grp['key']}"):
                     df_rounds = df_rounds.drop(g.index)
                     save_df = edited.copy()
                     t = g.iloc[0]
-                    # Preserve the original date string
                     for c in ["date", "course", "match_type", "holes_played", "match_id", "part_rp"]: 
                         if c in t: save_df[c] = t[c]
                         else: save_df[c] = 0
                     
                     new_rounds_db = pd.concat([df_rounds, save_df], ignore_index=True)
-                    # Drop temp columns before saving
-                    if "date_str" in new_rounds_db.columns: new_rounds_db = new_rounds_db.drop(columns=["date_str"])
-                    if "display_date" in new_rounds_db.columns: new_rounds_db = new_rounds_db.drop(columns=["display_date"])
+                    
+                    # FORCE STRING SAVE
+                    new_rounds_db["date"] = new_rounds_db["date"].astype(str)
                     
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
-                    
                     recalc_players = recalculate_all_handicaps(new_rounds_db, df_players)
                     conn.update(worksheet="players", data=recalc_players, spreadsheet=SPREADSHEET_NAME)
-                    
                     st.cache_data.clear()
                     st.success("Updated!")
                     st.rerun()
                     
                 if col_d.button("Delete Match", key=f"d_{grp['key']}"):
                     new_rounds_db = df_rounds.drop(g.index)
-                    if "date_str" in new_rounds_db.columns: new_rounds_db = new_rounds_db.drop(columns=["date_str"])
-                    if "display_date" in new_rounds_db.columns: new_rounds_db = new_rounds_db.drop(columns=["display_date"])
+                    # FORCE STRING SAVE
+                    new_rounds_db["date"] = new_rounds_db["date"].astype(str)
                     
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
                     recalc_players = recalculate_all_handicaps(new_rounds_db, df_players)
                     conn.update(worksheet="players", data=recalc_players, spreadsheet=SPREADSHEET_NAME)
-                    
                     st.cache_data.clear()
                     st.error("Deleted!")
                     st.rerun()
 
 with tab_admin:
     st.header("⚙️ Admin")
-    
-    # --- REPAIR TOOL ---
-    with st.expander("🚑 Data Repair (Fix Date Swaps)"):
-        st.write("Click this to swap Month/Day for Oct/Feb dates (e.g. 2026-10-01 -> 2026-01-10)")
-        if st.button("Fix Date Swap Errors"):
-            # Logic: Find rows where month is > current month (Jan) and swap day/month
-            changed_count = 0
-            if not df_rounds.empty:
-                # We iterate and modify the underlying dataframe
-                for idx, row in df_rounds.iterrows():
-                    d = row['date']
-                    # Check if month is Oct (10) or Feb (2) - strictly for this specific issue
-                    if d.month in [10, 2] and d.year == 2026:
-                        # Create new date by swapping
-                        try:
-                            new_date = datetime.date(d.year, d.day, d.month) # Swap M/D
-                            df_rounds.at[idx, 'date'] = pd.Timestamp(new_date)
-                            changed_count += 1
-                        except:
-                            pass # Invalid date if swapped (e.g. 30th Feb), skip
-                
-                if changed_count > 0:
-                    # Clean up temp cols
-                    save_db = df_rounds.copy()
-                    if "date_str" in save_db.columns: save_db = save_db.drop(columns=["date_str"])
-                    
-                    conn.update(worksheet="rounds", data=save_db, spreadsheet=SPREADSHEET_NAME)
-                    st.cache_data.clear()
-                    st.success(f"Fixed {changed_count} rows! Refreshing...")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.info("No incorrect dates found (Month 2 or 10).")
-
     with st.expander("⚠️ Danger Zone (Reset)"):
-        st.warning("Use this to wipe ALL rounds and reset handicaps.")
+        st.warning("Use this to wipe ALL rounds and reset handicaps to their original start value (Day 1 Reset).")
         confirm_reset = st.text_input("Type 'RESET LEAGUE' to wipe everything:")
         if st.button("☢️ Factory Reset League"):
             if confirm_reset == "RESET LEAGUE":
@@ -631,7 +619,7 @@ with tab_admin:
                 st.error("Type 'RESET LEAGUE' exactly.")
 
     with st.expander("🚀 Season Management (New Season)"):
-        st.warning("Use this when Season 1 ends.")
+        st.warning("Use this when Season 1 ends (e.g., July 1). It locks current handicaps as the new baseline.")
         confirm = st.text_input("Type 'NEW SEASON' to confirm:")
         if st.button("🚀 Start New Season"):
             if confirm == "NEW SEASON":
