@@ -210,7 +210,9 @@ if not df_rounds.empty and not stats.empty:
     # --- GROSS CONSISTENCY (THE ROCK) ---
     if not std_matches.empty:
         std_matches["norm_gross"] = std_matches.apply(lambda r: r["gross_score"] * 2 if r["holes_played"] == "9" else r["gross_score"], axis=1)
+        # Filter for consistency
         valid_gross = std_matches[std_matches["norm_gross"] > 0]
+        # Calculate Standard Deviation
         consistency = valid_gross.groupby("player_name")["norm_gross"].std()
         stats["Gross Consistency"] = stats["Gross Consistency"].add(consistency, fill_value=0)
 
@@ -285,8 +287,8 @@ def award_bonus(holder, points):
         stats.at[holder, current_season_col] += points
 
 if not stats.empty:
-    # --- THE ROCK: Lowest Gross Consistency (Min 5 Rounds) ---
-    q_rock = stats[(stats["Rounds"] >= 5) & (stats["Gross Consistency"] > 0)]
+    # --- THE ROCK: Lowest Gross Consistency (Min 3 Rounds) ---
+    q_rock = stats[(stats["Rounds"] >= 3) & (stats["Gross Consistency"] > 0)]
     if not q_rock.empty:
         holder_rock = resolve_tie(q_rock, "Gross Consistency", method="min")
         award_bonus(holder_rock, 10)
@@ -380,7 +382,7 @@ with tab_trophy:
         def card(c, i, t, d, w, b, r): c.markdown(f"""<div class="trophy-card"><div class="t-icon">{i}</div><div class="t-head">{t}</div><div class="t-sub">{d}<br><i>{r}</i></div><div class="t-name">{w}</div><div class="t-bonus">{b}</div></div>""", unsafe_allow_html=True)
 
         c1, c2, c3, c4 = st.columns(4)
-        card(c1, "🪨", "The Rock", "Best Consistency", txt(holder_rock, rv, "± Dev"), "+10", "Min 5 Rounds")
+        card(c1, "🪨", "The Rock", "Best Consistency", txt(holder_rock, rv, "± Dev"), "+10", "Min 3 Rounds")
         card(c2, "🚀", "The Rocket", "Biggest HCP Drop", txt(holder_rocket, rkv, "Drop"), "+10", "Min 3 Rounds")
         card(c3, "🎯", "The Sniper", "Best Gross (Month)", txt(holder_sniper, sv, "Strks"), "+5", "Std or 1v1 (18H)")
         card(c4, "👑", "The Conqueror", "Most Wins", txt(holder_conq, cv, "Wins"), "+10", "Min 3 Rounds")
@@ -432,10 +434,12 @@ with tab_submit:
                             new_hcp = calculate_new_handicap(curr_hcp, d['score'], hl)
                             df_players.loc[df_players["name"] == d['name'], "handicap"] = new_hcp
                             
+                            # --- EXPLICIT DATE FORMAT (DD-Mon-YYYY) ---
                             date_str = dt.strftime("%d-%b-%Y")
                             
                             new_rows.append({"date": date_str, "course": crs, "player_name": d['name'], "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], "rp_earned": rp, "notes": note, "match_type": "Standard", "match_id": batch_id, "part_rp": actual_part_earned})
                         
+                        # Save string column
                         combined_rounds = pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True)
                         combined_rounds["date"] = combined_rounds["date"].astype(str)
                         
@@ -526,7 +530,9 @@ with tab_history:
     if not df_rounds.empty:
         df_show = df_rounds.copy()
         
+        # Display as text to avoid Streamlit/Pandas guessing
         if "date" in df_show.columns:
+             # Ensure parsed so we can format
              df_show["_dt"] = pd.to_datetime(df_show["date"], errors='coerce')
              df_show['display_date'] = df_show['_dt'].dt.strftime('%d-%b-%Y')
              df_show['sort_val'] = df_show['_dt']
@@ -541,8 +547,10 @@ with tab_history:
         if not modern.empty:
             for m_id, g in modern.groupby("match_id"):
                 first = g.iloc[0]
+                # Use d_str instead of date
                 groups.append({"key": m_id, "label": f"📅 {first['display_date']} | {first['course']} | {first['match_type']} ({len(g)} Players)", "data": g, "sort_val": first['sort_val']})
         if not legacy.empty:
+            # Group legacy by date/course
             for (d_str, crs, mtype), g in legacy.groupby(['date', 'course', 'match_type']):
                 groups.append({"key": f"{d_str}_{crs}", "label": f"📅 {g.iloc[0]['display_date']} | {crs} | {mtype} (Legacy)", "data": g, "sort_val": g.iloc[0]['sort_val']})
         groups.sort(key=lambda x: x['sort_val'], reverse=True)
@@ -550,6 +558,7 @@ with tab_history:
         for grp in groups:
             with st.expander(grp["label"]):
                 g = grp["data"]
+                # Show raw columns for editing, hide internal ones
                 cols = ["player_name", "stableford_score", "gross_score", "rp_earned", "notes"]
                 edited = st.data_editor(g[cols], key=f"e_{grp['key']}", use_container_width=True, num_rows="dynamic")
                 col_s, col_d = st.columns([1, 4])
@@ -562,6 +571,8 @@ with tab_history:
                         else: save_df[c] = 0
                     
                     new_rounds_db = pd.concat([df_rounds, save_df], ignore_index=True)
+                    
+                    # FORCE STRING SAVE
                     new_rounds_db["date"] = new_rounds_db["date"].astype(str)
                     
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
@@ -573,6 +584,7 @@ with tab_history:
                     
                 if col_d.button("Delete Match", key=f"d_{grp['key']}"):
                     new_rounds_db = df_rounds.drop(g.index)
+                    # FORCE STRING SAVE
                     new_rounds_db["date"] = new_rounds_db["date"].astype(str)
                     
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
