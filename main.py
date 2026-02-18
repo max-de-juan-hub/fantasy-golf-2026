@@ -60,16 +60,10 @@ def load_data(conn):
     for col in ["gross_score", "stableford_score", "rp_earned", "part_rp"]:
         rounds[col] = pd.to_numeric(rounds[col], errors='coerce').fillna(0).astype(int)
 
-    # --- STRICT STRING DATES (NO AUTO-FIX) ---
-    # We convert whatever we get to a string immediately. 
-    # We DO NOT try to parse it into a datetime object for the 'date' column itself.
+    # --- STRICT DATE HANDLING ---
     rounds["date"] = rounds["date"].astype(str)
-    
-    # We create a separate parsed column just for sorting/season logic, but we NEVER save it back.
-    # dayfirst=True helps interpret "31/01/2026" correctly.
+    # Create internal object for logic, handle DD/MM or YYYY-MM
     rounds["_date_obj"] = pd.to_datetime(rounds["date"], dayfirst=True, errors='coerce')
-    
-    # Fallback for sorting: use today if parse fails
     rounds["_date_obj"] = rounds["_date_obj"].fillna(pd.Timestamp.now())
     
     return players, rounds
@@ -110,7 +104,6 @@ def recalculate_all_handicaps(df_rounds, df_players):
         hcp_map[row["name"]] = row["start_handicap"]
         
     if not df_rounds.empty:
-        # Sort by the temp object column
         sorted_rounds = df_rounds.sort_values("_date_obj", ascending=True)
         for idx, row in sorted_rounds.iterrows():
             if row["match_type"] == "Standard":
@@ -187,7 +180,7 @@ if df_players.empty:
     stats = pd.DataFrame()
 else:
     stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
-    cols = ["Total RP", "Season 1", "Season 2", "Season 3", "Season 4", "Bonus RP S1", "Bonus RP S2", "Bonus RP S3", "Bonus RP S4", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins", "Part RP S1", "Part RP S2", "Part RP S3", "Part RP S4", "Gross Consistency", "Past Sniper RP"]
+    cols = ["Total RP", "Season 1", "Season 2", "Season 3", "Season 4", "Bonus RP S1", "Bonus RP S2", "Bonus RP S3", "Bonus RP S4", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins", "Part RP S1", "Part RP S2", "Part RP S3", "Part RP S4", "Gross Consistency"]
     for c in cols: stats[c] = 0
     stats["2v2 Record"] = "0-0-0"
 
@@ -222,55 +215,56 @@ if not df_rounds.empty and not stats.empty:
         consistency = valid_gross.groupby("player_name")["norm_gross"].std()
         stats["Gross Consistency"] = stats["Gross Consistency"].add(consistency, fill_value=0)
 
-    # --- SNIPER LOGIC (MONTHLY) ---
-    curr_date = datetime.date.today()
-    
-    # 1. Calculate Past Month Winners (Bonus RP)
-    # Group by Year-Month
+    # --- SNIPER LOGIC (MONTHLY RESET) ---
     df_rounds["month_key"] = df_rounds["_date_obj"].dt.to_period("M")
     current_month_key = pd.Timestamp.now().to_period("M")
     
-    # Filter for standard/duel matches with gross scores
+    # Filter strictly for 18-hole gross scores
     gross_rnds = df_rounds[
         (df_rounds["holes_played"] == "18") &
         (df_rounds["match_type"].isin(["Standard", "Duel"])) &
         (df_rounds["gross_score"] > 0)
     ]
     
-    past_sniper_winners = {} # Store Month -> "Player (Score)"
+    sniper_history_text = ""
     
     if not gross_rnds.empty:
-        # Find best gross for each month EXCEPT current
+        # 1. PROCESS PAST MONTHS (Add Points & Build History)
+        # We group by Month, then find the winner
         monthly_bests = gross_rnds.groupby(["month_key", "player_name"])["gross_score"].min().reset_index()
         
-        for m_key, m_grp in monthly_bests.groupby("month_key"):
-            if m_key < current_month_key: # Past month
+        # Iterate over all months present in data
+        for m_key in monthly_bests["month_key"].unique():
+            if m_key < current_month_key: # Past Month
+                m_grp = monthly_bests[monthly_bests["month_key"] == m_key]
                 min_score = m_grp["gross_score"].min()
                 winners = m_grp[m_grp["gross_score"] == min_score]
                 
-                # Award +5 to past winners
+                w_names = []
                 for p in winners["player_name"]:
+                    w_names.append(p)
                     if p in stats.index:
-                        # Determine season for that month
-                        # Simplification: Map month to Season 1-4
+                        # Add 5 points to the correct season bin
                         m_idx = m_key.month
                         if 1<=m_idx<=3: s_col = "Bonus RP S1"
                         elif 4<=m_idx<=6: s_col = "Bonus RP S2"
                         elif 7<=m_idx<=9: s_col = "Bonus RP S3"
                         else: s_col = "Bonus RP S4"
-                        
                         stats.at[p, s_col] += 5
-                        
-                # Store text for display
-                w_text = ", ".join(winners["player_name"].tolist())
-                past_sniper_winners[str(m_key)] = f"{w_text} ({min_score})"
+                
+                # Add to history text (e.g. "Jan: Max (73)")
+                month_name = m_key.strftime("%b")
+                sniper_history_text += f"{month_name}: {', '.join(w_names)} ({min_score}) | "
 
-    # 2. Current Month Best Gross (Live Trophy)
+    # 2. CURRENT MONTH (Live Leaderboard Data)
+    # We strictly filter for rounds occurring THIS month
     current_month_rnds = gross_rnds[gross_rnds["month_key"] == current_month_key]
     if not current_month_rnds.empty:
         best_month = current_month_rnds.groupby("player_name")["gross_score"].min()
         for p, val in best_month.items():
             if p in stats.index: stats.at[p, "Best Gross"] = val
+    
+    # ------------------------------------
 
     if not std_matches.empty:
         for mid, group in std_matches.groupby("match_id"):
@@ -330,7 +324,6 @@ def award_bonus(holder, points):
         stats.at[holder, current_season_col] += points
 
 if not stats.empty:
-    # --- THE ROCK: Lowest Gross Consistency (Min 3 Rounds) ---
     q_rock = stats[(stats["Rounds"] >= 3) & (stats["Gross Consistency"] > 0)]
     if not q_rock.empty:
         holder_rock = resolve_tie(q_rock, "Gross Consistency", method="min")
@@ -345,10 +338,12 @@ if not stats.empty:
             award_bonus(holder_rocket, 10)
 
     # SNIPER (Current Month Bonus)
+    # We check if anyone has a score for the CURRENT month
     q_sniper = stats[stats["Best Gross"] > 0]
     if not q_sniper.empty:
         holder_sniper = resolve_tie(q_sniper, "Best Gross", method="min")
-        award_bonus(holder_sniper, 5)
+        # NOTE: We DO NOT award +5 bonus for the current month yet. It's live.
+        # Only past months get the permanent +5 in the logic above.
 
     q_conq = stats[stats["Rounds"] >= 3]
     if not q_conq.empty:
@@ -386,7 +381,6 @@ with tab_leaderboard:
         else: curr_part_col = "Part RP S1"
         v["Part. Cap (20)"] = v[curr_part_col].astype(int).astype(str) + "/20"
 
-        # --- LEADERBOARD COLUMNS UPDATED ---
         cols_order = ["Player", "Total RP", "Handicap", "Daily Wins", "Best Round (Month)", "Consistency (±)", "Rounds Played", "Part. Cap (20)", "1v1 Record", "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2", "Season 3 RP", "Bonus RP S3", "Season 4 RP", "Bonus RP S4"]
         final_cols = [c for c in cols_order if c in v.columns]
         v = v[final_cols]
@@ -429,17 +423,12 @@ with tab_trophy:
 
         c1, c2, c3, c4 = st.columns(4)
         
-        # Prepare history string for Sniper
-        last_month_key = (pd.Timestamp.now() - pd.DateOffset(months=1)).to_period("M")
-        last_month_str = str(last_month_key)
-        hist_txt = past_sniper_winners.get(last_month_str, "None") if 'past_sniper_winners' in locals() else ""
-        if hist_txt != "None" and hist_txt != "":
-             hist_display = f"{last_month_str}: {hist_txt}"
-        else: hist_display = ""
+        # Clean history text for display
+        sniper_hist_display = sniper_history_text.rstrip(" | ")
 
         card(c1, "🪨", "The Rock", "Best Consistency", txt(holder_rock, rv, "± Dev"), "+10", "Min 3 Rounds")
         card(c2, "🚀", "The Rocket", "Biggest HCP Drop", txt(holder_rocket, rkv, "Drop"), "+10", "Min 3 Rounds")
-        card(c3, "🎯", "The Sniper", "Best Gross (Month)", txt(holder_sniper, sv, "Strks"), "+5", "Std or 1v1 (18H)", hist_display)
+        card(c3, "🎯", "The Sniper", "Best Gross (Month)", txt(holder_sniper, sv, "Strks"), "+5", "Std or 1v1 (18H)", sniper_hist_display)
         card(c4, "👑", "The Conqueror", "Most Wins", txt(holder_conq, cv, "Wins"), "+10", "Min 3 Rounds")
 
 with tab_submit:
@@ -494,7 +483,6 @@ with tab_submit:
                             
                             new_rows.append({"date": date_str, "course": crs, "player_name": d['name'], "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], "rp_earned": rp, "notes": note, "match_type": "Standard", "match_id": batch_id, "part_rp": actual_part_earned})
                         
-                        # Save string column
                         combined_rounds = pd.concat([df_rounds, pd.DataFrame(new_rows)], ignore_index=True)
                         combined_rounds["date"] = combined_rounds["date"].astype(str)
                         
@@ -585,7 +573,6 @@ with tab_history:
     if not df_rounds.empty:
         df_show = df_rounds.copy()
         
-        # Sort by internal date obj, but display string
         df_show = df_show.sort_values("_date_obj", ascending=False)
         modern = df_show[df_show["match_id"] != "legacy"]
         legacy = df_show[df_show["match_id"] == "legacy"]
@@ -593,7 +580,6 @@ with tab_history:
         if not modern.empty:
             for m_id, g in modern.groupby("match_id"):
                 first = g.iloc[0]
-                # Use "date" column directly which is string "DD-Mon-YYYY"
                 groups.append({"key": m_id, "label": f"📅 {first['date']} | {first['course']} | {first['match_type']} ({len(g)} Players)", "data": g, "sort_val": first['_date_obj']})
         if not legacy.empty:
             for (d_str, crs, mtype), g in legacy.groupby(['date', 'course', 'match_type']):
@@ -617,13 +603,11 @@ with tab_history:
                     new_rounds_db = pd.concat([df_rounds, save_df], ignore_index=True)
                     new_rounds_db["date"] = new_rounds_db["date"].astype(str)
                     
-                    # Clean temp col before save
                     if "_date_obj" in new_rounds_db.columns: new_rounds_db = new_rounds_db.drop(columns=["_date_obj"])
+                    if "month_key" in new_rounds_db.columns: new_rounds_db = new_rounds_db.drop(columns=["month_key"])
                     
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
                     
-                    # Reload to recalc handicaps with correct order
-                    # (Simplified here: just save and let reload handle it next time or force reload)
                     st.cache_data.clear()
                     st.success("Updated!")
                     st.rerun()
@@ -632,6 +616,7 @@ with tab_history:
                     new_rounds_db = df_rounds.drop(g.index)
                     new_rounds_db["date"] = new_rounds_db["date"].astype(str)
                     if "_date_obj" in new_rounds_db.columns: new_rounds_db = new_rounds_db.drop(columns=["_date_obj"])
+                    if "month_key" in new_rounds_db.columns: new_rounds_db = new_rounds_db.drop(columns=["month_key"])
                     
                     conn.update(worksheet="rounds", data=new_rounds_db, spreadsheet=SPREADSHEET_NAME)
                     st.cache_data.clear()
@@ -642,7 +627,7 @@ with tab_admin:
     st.header("⚙️ Admin")
     
     with st.expander("⚠️ Danger Zone (Reset)"):
-        st.warning("Use this to wipe ALL rounds and reset handicaps.")
+        st.warning("Use this to wipe ALL rounds and reset handicaps to their original start value (Day 1 Reset).")
         confirm_reset = st.text_input("Type 'RESET LEAGUE' to wipe everything:")
         if st.button("☢️ Factory Reset League"):
             if confirm_reset == "RESET LEAGUE":
