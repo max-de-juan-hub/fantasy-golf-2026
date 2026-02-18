@@ -210,9 +210,7 @@ if not df_rounds.empty and not stats.empty:
     # --- GROSS CONSISTENCY (THE ROCK) ---
     if not std_matches.empty:
         std_matches["norm_gross"] = std_matches.apply(lambda r: r["gross_score"] * 2 if r["holes_played"] == "9" else r["gross_score"], axis=1)
-        # Filter for consistency
         valid_gross = std_matches[std_matches["norm_gross"] > 0]
-        # Calculate Standard Deviation
         consistency = valid_gross.groupby("player_name")["norm_gross"].std()
         stats["Gross Consistency"] = stats["Gross Consistency"].add(consistency, fill_value=0)
 
@@ -596,6 +594,7 @@ with tab_history:
 
 with tab_admin:
     st.header("⚙️ Admin")
+    
     with st.expander("⚠️ Danger Zone (Reset)"):
         st.warning("Use this to wipe ALL rounds and reset handicaps to their original start value (Day 1 Reset).")
         confirm_reset = st.text_input("Type 'RESET LEAGUE' to wipe everything:")
