@@ -17,13 +17,12 @@ SPREADSHEET_NAME = "fantasy_golf_db"
 MAX_PARTICIPATION_RP = 20  # Cap per season
 
 # 🏆 PAST CHAMPIONS LOCK-IN 🏆
-# Type the exact names of the Season 1 winners here. 
 # The app will permanently award them +10 points and display them in the Trophy Room.
 PAST_CHAMPIONS = {
     "Season 1": {
-        "Rock": "Max De Juan",       # Replace with actual winner
-        "Rocket": "Jokin",           # Replace with actual winner
-        "Conqueror": "Max De Juan"   # Replace with actual winner
+        "Rock": "Max De Juan (± 6.18)",
+        "Rocket": "Jokin (8.0 Drop)",
+        "Conqueror": "Max De Juan (4 Wins)"
     }
 }
 
@@ -193,7 +192,7 @@ if df_players.empty:
     stats = pd.DataFrame()
 else:
     stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
-    cols = ["Total RP", "Season 1", "Season 2", "Season 3", "Season 4", "Bonus RP S1", "Bonus RP S2", "Bonus RP S3", "Bonus RP S4", "Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins", "Part RP S1", "Part RP S2", "Part RP S3", "Part RP S4", "Gross Consistency"]
+    cols = ["Total RP", "Season 1", "Season 2", "Season 3", "Season 4", "Bonus RP S1", "Bonus RP S2", "Bonus RP S3", "Bonus RP S4", "Rounds", "Total Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins", "Part RP S1", "Part RP S2", "Part RP S3", "Part RP S4", "Gross Consistency"]
     for c in cols: stats[c] = 0
     stats["2v2 Record"] = "0-0-0"
 
@@ -219,9 +218,16 @@ if not df_rounds.empty and not stats.empty:
     for s_name, awards in PAST_CHAMPIONS.items():
         s_num = s_name.split(" ")[1]
         t_col = f"Bonus RP S{s_num}"
-        for award_name, p_name in awards.items():
-            if p_name and p_name in stats.index:
-                stats.at[p_name, t_col] += 10
+        for award_name, p_string in awards.items():
+            if p_string:
+                # Extract just the name from the string (e.g., "Max De Juan (4 Wins)" -> "Max De Juan")
+                p_name = p_string.split(" (")[0]
+                if p_name in stats.index:
+                    stats.at[p_name, t_col] += 10
+
+    # --- ALL-TIME ROUNDS ---
+    total_rounds_count = df_rounds.groupby("player_name").size()
+    stats["Total Rounds"] = stats["Total Rounds"].add(total_rounds_count, fill_value=0)
 
     # --- CURRENT SEASON ISOLATION FOR LEADERBOARD STATS ---
     # These stats reset to 0 when a new season starts
@@ -345,8 +351,8 @@ def award_bonus(holder, points):
 
 if not stats.empty:
     # --- LIVE TROPHIES ---
-    # Since stats["Rounds"] and stats["Gross Consistency"] are now calculated ONLY for the current season,
-    # these trophies automatically reset at the start of a new season.
+    # stats["Rounds"] and stats["Gross Consistency"] are calculated ONLY for the current season.
+    # Therefore, they auto-reset on April 1st.
     
     q_rock = stats[(stats["Rounds"] >= 3) & (stats["Gross Consistency"] > 0)]
     if not q_rock.empty:
@@ -399,7 +405,7 @@ with tab_leaderboard:
     else:
         v = stats.copy()
         v["1v1 Record"] = v["1v1 Wins"].astype(int).astype(str) + "-" + v["1v1 Losses"].astype(int).astype(str)
-        v = v.rename(columns={"handicap": "Handicap", "Best Gross": "Best Round (Month)", "Gross Consistency": "Consistency (±)", "Rounds": "Rounds Played (S)", "Season 1": "Season 1 RP", "Season 2": "Season 2 RP", "Season 3": "Season 3 RP", "Season 4": "Season 4 RP", "Daily Wins": "Wins (S)"})
+        v = v.rename(columns={"handicap": "Handicap", "Best Gross": "Best Round (Month)", "Gross Consistency": "Consistency (±)", "Rounds": "Rounds (S)", "Daily Wins": "Wins (S)", "Season 1": "Season 1 RP", "Season 2": "Season 2 RP", "Season 3": "Season 3 RP", "Season 4": "Season 4 RP"})
         
         if "Season" in current_season:
             s_num = current_season.split(" ")[1]
@@ -408,7 +414,7 @@ with tab_leaderboard:
         v["Part. Cap (20)"] = v[curr_part_col].astype(int).astype(str) + "/20"
 
         # --- LEADERBOARD COLUMNS UPDATED ---
-        cols_order = ["Player", "Total RP", "Handicap", "Wins (S)", "Best Round (Month)", "Consistency (±)", "Rounds Played (S)", "Part. Cap (20)", "1v1 Record", "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2", "Season 3 RP", "Bonus RP S3", "Season 4 RP", "Bonus RP S4"]
+        cols_order = ["Player", "Total RP", "Handicap", "Wins (S)", "Best Round (Month)", "Consistency (±)", "Rounds (S)", "Total Rounds", "Part. Cap (20)", "1v1 Record", "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2", "Season 3 RP", "Bonus RP S3", "Season 4 RP", "Bonus RP S4"]
         final_cols = [c for c in cols_order if c in v.columns]
         v = v[final_cols]
 
@@ -458,10 +464,10 @@ with tab_trophy:
         
         sniper_hist_display = sniper_history_text.rstrip("  ")
 
-        card(c1, "🪨", "The Rock", "Best Consistency", txt(holder_rock, rv, "± Dev"), "+10", "Min 3 Rounds", past_rocks)
-        card(c2, "🚀", "The Rocket", "Biggest HCP Drop", txt(holder_rocket, rkv, "Drop"), "+10", "Min 3 Rounds", past_rockets)
+        card(c1, "🪨", "The Rock", "Best Consistency", txt(holder_rock, rv, "± Dev"), "+10", "Min 3 Rounds", past_rocks, "Past Rocks")
+        card(c2, "🚀", "The Rocket", "Biggest HCP Drop", txt(holder_rocket, rkv, "Drop"), "+10", "Min 3 Rounds", past_rockets, "Past Rockets")
         card(c3, "🎯", "The Sniper", "Best Gross (Current Month)", txt(holder_sniper, sv, "Strks"), "+5 (Live)", "Std or 1v1 (18H)", sniper_hist_display, "Past Snipers")
-        card(c4, "👑", "The Conqueror", "Most Wins", txt(holder_conq, cv, "Wins"), "+10", "Min 3 Rounds", past_conqs)
+        card(c4, "👑", "The Conqueror", "Most Wins", txt(holder_conq, cv, "Wins"), "+10", "Min 3 Rounds", past_conqs, "Past Conquerors")
 
 with tab_submit:
     st.subheader("Choose Game Mode")
