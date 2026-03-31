@@ -130,6 +130,36 @@ def recalculate_all_handicaps(df_rounds, df_players):
             df_players.at[idx, "handicap"] = hcp_map[row["name"]]
     return df_players
 
+# --- DYNAMIC START HANDICAP CALCULATION ---
+def get_start_handicaps_for_season(df_rounds, df_players, target_season):
+    """Calculates what everyone's handicap was at the BEGINNING of the target season."""
+    hcp_map = {}
+    # 1. Initialize with original day-1 handicaps
+    for idx, row in df_players.iterrows():
+        hcp_map[row["name"]] = row["start_handicap"]
+        
+    if not df_rounds.empty:
+        # 2. Play through rounds chronologically
+        sorted_rounds = df_rounds.sort_values("_date_obj", ascending=True)
+        for idx, row in sorted_rounds.iterrows():
+            season_of_round = get_season(row["_date_obj"])
+            
+            # 3. Stop calculating once we reach the target season
+            # (Because we only want to know the handicap BEFORE this season started)
+            if season_of_round == target_season:
+                continue # We don't apply this round's adjustments to the baseline
+                
+            if row["match_type"] == "Standard":
+                p_name = row["player_name"]
+                score = row["stableford_score"]
+                holes = row["holes_played"]
+                if p_name in hcp_map:
+                    old_hcp = hcp_map[p_name]
+                    new_hcp = calculate_new_handicap(old_hcp, score, holes)
+                    hcp_map[p_name] = new_hcp
+                    
+    return hcp_map
+
 def calculate_standard_rp(score, holes, is_clean, is_road, is_hio, group_data, current_player, player_rp_map, current_season_part_rp):
     breakdown = []
     is_9 = (str(holes) == "9")
@@ -192,17 +222,15 @@ if df_players.empty:
     stats = pd.DataFrame()
 else:
     stats = df_players.copy().rename(columns={"name": "player_name"}).set_index("player_name")
-    cols = ["Total RP", "Season 1", "Season 2", "Season 3", "Season 4", "Bonus RP S1", "Bonus RP S2", "Bonus RP S3", "Bonus RP S4", "Rounds", "Total Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins", "Part RP S1", "Part RP S2", "Part RP S3", "Part RP S4", "Gross Consistency"]
+    cols = ["Total RP", "Season 1", "Season 2", "Season 3", "Season 4", "Bonus RP S1", "Bonus RP S2", "Bonus RP S3", "Bonus RP S4", "Rounds (S)", "Total Rounds", "Avg Score", "Best Gross", "1v1 Wins", "1v1 Losses", "Daily Wins", "Part RP S1", "Part RP S2", "Part RP S3", "Part RP S4", "Gross Consistency"]
     for c in cols: stats[c] = 0
     stats["2v2 Record"] = "0-0-0"
 
 current_rp_map = {}
 
 if not df_rounds.empty and not stats.empty:
-    # Append the calculated season to the rounds
     df_rounds["season"] = df_rounds["_date_obj"].apply(get_season)
     
-    # Base RP Calculation (ALL SEASONS)
     season_rp = df_rounds.groupby(["player_name", "season"])["rp_earned"].sum().unstack(fill_value=0)
     part_rp_sum = df_rounds.groupby(["player_name", "season"])["part_rp"].sum().unstack(fill_value=0)
     
@@ -220,7 +248,6 @@ if not df_rounds.empty and not stats.empty:
         t_col = f"Bonus RP S{s_num}"
         for award_name, p_string in awards.items():
             if p_string:
-                # Extract just the name from the string (e.g., "Max De Juan (4 Wins)" -> "Max De Juan")
                 p_name = p_string.split(" (")[0]
                 if p_name in stats.index:
                     stats.at[p_name, t_col] += 10
@@ -230,15 +257,13 @@ if not df_rounds.empty and not stats.empty:
     stats["Total Rounds"] = stats["Total Rounds"].add(total_rounds_count, fill_value=0)
 
     # --- CURRENT SEASON ISOLATION FOR LEADERBOARD STATS ---
-    # These stats reset to 0 when a new season starts
     df_current_season = df_rounds[df_rounds["season"] == current_season]
     
     rounds_count = df_current_season.groupby("player_name").size()
-    stats["Rounds"] = stats["Rounds"].add(rounds_count, fill_value=0)
+    stats["Rounds (S)"] = stats["Rounds (S)"].add(rounds_count, fill_value=0)
 
     std_current = df_current_season[df_current_season["match_type"] == "Standard"]
     
-    # Gross Consistency (Current Season)
     if not std_current.empty:
         std_current_copy = std_current.copy()
         std_current_copy["norm_gross"] = std_current_copy.apply(lambda r: r["gross_score"] * 2 if str(r["holes_played"]) == "9" else r["gross_score"], axis=1)
@@ -246,7 +271,6 @@ if not df_rounds.empty and not stats.empty:
         consistency = valid_gross.groupby("player_name")["norm_gross"].std()
         stats["Gross Consistency"] = stats["Gross Consistency"].add(consistency, fill_value=0)
 
-    # Daily Wins (Current Season ONLY - Standard and Alliance)
     if not std_current.empty:
         for mid, group in std_current.groupby("match_id"):
             max_s = group["stableford_score"].max()
@@ -273,7 +297,6 @@ if not df_rounds.empty and not stats.empty:
     sniper_history_text = ""
     
     if not gross_rnds.empty:
-        # A. PAST MONTHS (Permanent Points & History)
         monthly_bests = gross_rnds.groupby(["month_period"])["gross_score"].min()
         
         for period, min_score in monthly_bests.items():
@@ -281,11 +304,9 @@ if not df_rounds.empty and not stats.empty:
                 winners = gross_rnds[(gross_rnds["month_period"] == period) & (gross_rnds["gross_score"] == min_score)]
                 winner_names = winners["player_name"].unique().tolist()
                 
-                # Format History Text
                 month_name = period.strftime("%b")
                 sniper_history_text += f"**{month_name}:** {', '.join(winner_names)} ({int(min_score)})<br>"
                 
-                # Award Permanent Points to Past Winners
                 for p in winner_names:
                     if p in stats.index:
                         m_idx = period.month
@@ -295,16 +316,13 @@ if not df_rounds.empty and not stats.empty:
                         else: target = "Bonus RP S4"
                         stats.at[p, target] += 5
 
-        # B. CURRENT MONTH (Live Display)
         current_pool = gross_rnds[gross_rnds["month_period"] == current_month_period]
         if not current_pool.empty:
-            # We save the current month's best to 'Best Gross' for the leaderboard & trophy logic
             best_curr = current_pool.groupby("player_name")["gross_score"].min()
             for p, score in best_curr.items():
                 if p in stats.index:
                     stats.at[p, "Best Gross"] = score
 
-    # --- 1v1 and 2v2 Records (Keep All-Time for pride) ---
     duels = df_rounds[df_rounds["match_type"] == "Duel"]
     if not duels.empty:
         w = duels[duels["rp_earned"] > 0].groupby("player_name").size()
@@ -330,17 +348,14 @@ else: current_season_col = "Bonus RP S1"
 
 def resolve_tie(cand, metric, method="max"):
     if len(cand) == 1: return cand.index[0]
-    
     if method == "min": 
         if metric == "Best Gross": cand = cand[cand[metric] > 0]
         if cand.empty: return None
         best_val = cand[metric].min()
     else: 
         best_val = cand[metric].max()
-        
     tied = cand[cand[metric] == best_val]
     if len(tied) == 1: return tied.index[0]
-    
     best_wins = tied["Daily Wins"].max()
     tied_wins = tied[tied["Daily Wins"] == best_wins]
     return tied_wins.index[0] if len(tied_wins) == 1 else "Tied"
@@ -350,37 +365,35 @@ def award_bonus(holder, points):
         stats.at[holder, current_season_col] += points
 
 if not stats.empty:
-    # --- LIVE TROPHIES ---
-    # stats["Rounds"] and stats["Gross Consistency"] are calculated ONLY for the current season.
-    # Therefore, they auto-reset on April 1st.
-    
-    q_rock = stats[(stats["Rounds"] >= 3) & (stats["Gross Consistency"] > 0)]
+    q_rock = stats[(stats["Rounds (S)"] >= 3) & (stats["Gross Consistency"] > 0)]
     if not q_rock.empty:
         holder_rock = resolve_tie(q_rock, "Gross Consistency", method="min")
         award_bonus(holder_rock, 10)
 
-    # Rocket (Current handicap vs locked start_handicap)
-    stats["HCP Reduction"] = stats.apply(lambda row: df_players.loc[df_players["name"]==row.name, "start_handicap"].values[0] - row["handicap"] if row.name in df_players["name"].values else 0, axis=1)
-    q_rocket = stats[stats["Rounds"] >= 3]
+    # --- DYNAMIC ROCKET CALCULATION ---
+    # Get the baseline handicaps for the start of the current season
+    season_start_hcps = get_start_handicaps_for_season(df_rounds, df_players, current_season)
+    
+    # Calculate reduction based on that dynamic start point
+    stats["HCP Reduction"] = stats.apply(lambda row: season_start_hcps.get(row.name, df_players.loc[df_players["name"]==row.name, "start_handicap"].values[0]) - df_players.loc[df_players["name"]==row.name, "handicap"].values[0] if row.name in df_players["name"].values else 0, axis=1)
+    
+    q_rocket = stats[stats["Rounds (S)"] >= 3]
     if not q_rocket.empty:
         q_rocket = q_rocket[q_rocket["HCP Reduction"] > 0]
         if not q_rocket.empty:
             holder_rocket = resolve_tie(q_rocket, "HCP Reduction", method="max")
             award_bonus(holder_rocket, 10)
 
-    # Sniper (Current Month Leader)
     q_sniper = stats[stats["Best Gross"] > 0]
     if not q_sniper.empty:
         holder_sniper = resolve_tie(q_sniper, "Best Gross", method="min")
-        award_bonus(holder_sniper, 5) # Live points
+        award_bonus(holder_sniper, 5) 
 
-    # Conqueror
-    q_conq = stats[stats["Rounds"] >= 3]
+    q_conq = stats[stats["Rounds (S)"] >= 3]
     if not q_conq.empty:
         holder_conq = resolve_tie(q_conq, "Daily Wins", method="max")
         award_bonus(holder_conq, 10)
 
-    # SUM EVERYTHING
     stats["Total RP"] = (stats["Season 1"] + stats["Bonus RP S1"] + stats["Season 2"] + stats["Bonus RP S2"] + stats["Season 3"] + stats["Bonus RP S3"] + stats["Season 4"] + stats["Bonus RP S4"])
     
     for p, val in stats["Total RP"].items(): current_rp_map[p] = val
@@ -405,7 +418,11 @@ with tab_leaderboard:
     else:
         v = stats.copy()
         v["1v1 Record"] = v["1v1 Wins"].astype(int).astype(str) + "-" + v["1v1 Losses"].astype(int).astype(str)
-        v = v.rename(columns={"handicap": "Handicap", "Best Gross": "Best Round (Month)", "Gross Consistency": "Consistency (±)", "Rounds": "Rounds (S)", "Daily Wins": "Wins (S)", "Season 1": "Season 1 RP", "Season 2": "Season 2 RP", "Season 3": "Season 3 RP", "Season 4": "Season 4 RP"})
+        
+        # Merge Rounds into a single string column: "Season / Total"
+        v["Rounds (S / T)"] = v["Rounds (S)"].astype(int).astype(str) + " / " + v["Total Rounds"].astype(int).astype(str)
+        
+        v = v.rename(columns={"handicap": "Handicap", "Best Gross": "Best Round (Month)", "Gross Consistency": "Consistency (±)", "Daily Wins": "Wins (S)", "Season 1": "Season 1 RP", "Season 2": "Season 2 RP", "Season 3": "Season 3 RP", "Season 4": "Season 4 RP"})
         
         if "Season" in current_season:
             s_num = current_season.split(" ")[1]
@@ -414,12 +431,12 @@ with tab_leaderboard:
         v["Part. Cap (20)"] = v[curr_part_col].astype(int).astype(str) + "/20"
 
         # --- LEADERBOARD COLUMNS UPDATED ---
-        cols_order = ["Player", "Total RP", "Handicap", "Wins (S)", "Best Round (Month)", "Consistency (±)", "Rounds (S)", "Total Rounds", "Part. Cap (20)", "1v1 Record", "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2", "Season 3 RP", "Bonus RP S3", "Season 4 RP", "Bonus RP S4"]
+        cols_order = ["Player", "Total RP", "Handicap", "Wins (S)", "Best Round (Month)", "Consistency (±)", "Rounds (S / T)", "Part. Cap (20)", "1v1 Record", "2v2 Record", "Season 1 RP", "Bonus RP S1", "Season 2 RP", "Bonus RP S2", "Season 3 RP", "Bonus RP S3", "Season 4 RP", "Bonus RP S4"]
         final_cols = [c for c in cols_order if c in v.columns]
         v = v[final_cols]
 
         for col in v.columns:
-            if col not in ["Player", "1v1 Record", "2v2 Record", "Part. Cap (20)"]:
+            if col not in ["Player", "1v1 Record", "2v2 Record", "Part. Cap (20)", "Rounds (S / T)"]:
                 v[col] = v[col].apply(fmt_num)
 
         def color_row(row):
@@ -450,7 +467,6 @@ with tab_trophy:
         cv = get_val(holder_conq, "Daily Wins")
         rkv = get_val(holder_rocket, "HCP Reduction")
         
-        # Pull past champions from the dictionary for display
         past_rocks = "<br>".join([f"<b>{s}</b>: {data['Rock']}" for s, data in PAST_CHAMPIONS.items() if data['Rock']])
         past_rockets = "<br>".join([f"<b>{s}</b>: {data['Rocket']}" for s, data in PAST_CHAMPIONS.items() if data['Rocket']])
         past_conqs = "<br>".join([f"<b>{s}</b>: {data['Conqueror']}" for s, data in PAST_CHAMPIONS.items() if data['Conqueror']])
@@ -516,7 +532,6 @@ with tab_submit:
                             new_hcp = calculate_new_handicap(curr_hcp, d['score'], hl)
                             df_players.loc[df_players["name"] == d['name'], "handicap"] = new_hcp
                             
-                            # --- ISO DATE SAVE ---
                             date_str = dt.strftime("%Y-%m-%d")
                             
                             new_rows.append({"date": date_str, "course": crs, "player_name": d['name'], "holes_played": hl, "stableford_score": d['score'], "gross_score": d['gross'], "rp_earned": rp, "notes": note, "match_type": "Standard", "match_id": batch_id, "part_rp": actual_part_earned})
@@ -617,7 +632,6 @@ with tab_history:
     if not df_rounds.empty:
         df_show = df_rounds.copy()
         
-        # Display directly what is in the sheet
         df_show = df_show.sort_values("_date_obj", ascending=False)
         modern = df_show[df_show["match_id"] != "legacy"]
         legacy = df_show[df_show["match_id"] == "legacy"]
@@ -689,15 +703,15 @@ with tab_admin:
             else:
                 st.error("Type 'RESET LEAGUE' exactly.")
 
-    with st.expander("🚀 Season Management (New Season)"):
-        st.warning("Use this when a Season ends (e.g., April 1). It locks current handicaps as the baseline for the new season.")
+    with st.expander("🚀 Season Management (Manual Override)"):
+        st.warning("Use this to manually lock current handicaps as the baseline for the new season.")
         confirm = st.text_input("Type 'NEW SEASON' to confirm:")
-        if st.button("🚀 Start New Season"):
+        if st.button("🚀 Lock Handicaps for New Season"):
             if confirm == "NEW SEASON":
                 df_players["start_handicap"] = df_players["handicap"]
                 conn.update(worksheet="players", data=df_players, spreadsheet=SPREADSHEET_NAME)
                 st.cache_data.clear()
-                st.success("New Season Started!")
+                st.success("Handicaps Locked!")
                 st.rerun()
 
     st.write("### 🔍 Debug Data")
